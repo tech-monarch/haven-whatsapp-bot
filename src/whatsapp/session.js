@@ -5,13 +5,16 @@
  * {
  *   [phoneNumber]: {
  *     messages: [{ role: 'user'|'assistant', text: string, at: ISOString }],
- *     userPreferences: { lastService, lastLocation, ... }
+ *     userPreferences: {
+ *       lastService, lastLocation, lastBudget,
+ *       lastShownArtisans,   // artisans shown in the previous search result
+ *       userName,            // captured from conversation
+ *     }
  *   }
  * }
  *
- * This module exposes a small interface (get/append/setPreferences/clear) so that
- * swapping the backing store for PostgreSQL/MongoDB later only requires
- * reimplementing this file — no changes needed in messageHandler.js or agent.js.
+ * Deliberately behind a small interface so swapping to a persistent store
+ * (Postgres/Redis) only requires rewriting this file.
  */
 
 const MAX_MESSAGES_PER_USER = 20;
@@ -35,8 +38,7 @@ function appendMessage(phoneNumber, role, text) {
 }
 
 function getRecentMessages(phoneNumber, count = 6) {
-  const session = getSession(phoneNumber);
-  return session.messages.slice(-count);
+  return getSession(phoneNumber).messages.slice(-count);
 }
 
 function setPreferences(phoneNumber, partialPrefs) {
@@ -53,6 +55,21 @@ function clearSession(phoneNumber) {
   store.delete(phoneNumber);
 }
 
+/**
+ * Store the artisans shown in the last search result so that a follow-up
+ * "connect me to #2" can resolve the selection without another search.
+ *
+ * @param {string} phoneNumber
+ * @param {object[]} artisans - the ranked list that was presented to the user
+ */
+function setLastShownArtisans(phoneNumber, artisans) {
+  setPreferences(phoneNumber, { lastShownArtisans: artisans.slice(0, 5) });
+}
+
+function getLastShownArtisans(phoneNumber) {
+  return getPreferences(phoneNumber).lastShownArtisans || [];
+}
+
 module.exports = {
   getSession,
   appendMessage,
@@ -60,4 +77,6 @@ module.exports = {
   setPreferences,
   getPreferences,
   clearSession,
+  setLastShownArtisans,
+  getLastShownArtisans,
 };
