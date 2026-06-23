@@ -24,6 +24,10 @@ const config = {
   whatsapp: {
     authDir: required('WA_AUTH_DIR', 'auth_sessions'),
     ignoreGroups: true,
+    // Phone number in international format WITHOUT the leading '+'.
+    // Example: 2349067296455  (234 = Nigeria country code)
+    // Set WA_PHONE_NUMBER in your .env — do NOT hardcode it here.
+    phoneNumber: required('WA_PHONE_NUMBER', ''),
   },
 
   admins: (required('ADMIN_NUMBERS', '') || '')
@@ -40,3 +44,11 @@ if (!config.gemini.apiKey) {
 }
 
 module.exports = config;
+
+if (!config.whatsapp.phoneNumber) {
+  // eslint-disable-next-line no-console
+  console.warn(
+    '[config] WARNING: WA_PHONE_NUMBER is not set. Pairing code auth will fail on first login. ' +
+    'Set it in .env as digits only, no + (e.g. WA_PHONE_NUMBER=2349067296455).'
+  );
+}
