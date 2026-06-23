@@ -57,7 +57,7 @@ async function startWhatsApp(onReady, onMessage) {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
-  // -- 2. Socket ------------------------------------------------------------
+  // -- 2. Socket -----------------------------------------------------------
   const sock = makeWASocket({
     version,
     auth: state,
