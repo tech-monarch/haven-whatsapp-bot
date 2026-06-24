@@ -116,7 +116,7 @@ Write a short, warm WhatsApp reply to the user${greeting ? ` (address them warml
 - Do not use markdown headers or backticks. WhatsApp supports *bold* and _italic_ and emojis.
 - Keep it under 130 words.`;
 }
-}
+
 
 module.exports = {
   SYSTEM_PROMPT,
