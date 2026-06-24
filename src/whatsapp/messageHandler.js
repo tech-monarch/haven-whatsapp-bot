@@ -7,7 +7,7 @@ const logger = require('../config/logger');
 const TYPING_DELAY_MS   = 600;
 const MAX_MESSAGE_LENGTH = 2000;
 
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------
 // Rate limiting — sliding window per user
 // Max 12 messages per 60 seconds. Warn the user at 10.
 // ---------------------------------------------------------------------------
