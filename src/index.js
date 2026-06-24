@@ -1,4 +1,5 @@
 const http = require('http');
+const https = require('https');
 const config = require('./config');
 const logger = require('./config/logger');
 const artisanService = require('./artisans/artisanService');
@@ -33,27 +34,27 @@ function startHealthServer() {
 // from hibernating on platforms like Render's free tier.
 // ---------------------------------------------------------------------------
 function startSelfPing() {
-  const PING_INTERVAL_MS = 10_000; // 10 seconds
+  const PING_INTERVAL_MS = 10_000;
 
-  // Determine where we're running so the ping goes to the right URL.
-  // On Render, RENDER_EXTERNAL_URL is set automatically.
-  // Fallback to localhost on dev machines.
   const baseUrl =
     process.env.RENDER_EXTERNAL_URL ||
     `http://localhost:${config.port}`;
 
   const pingUrl = `${baseUrl}/health`;
 
+  const client = pingUrl.startsWith('https://') ? https : http;
+
   setInterval(() => {
-    http.get(pingUrl, (res) => {
-      // Consume the response body so Node doesn't hold the socket open
+    client.get(pingUrl, (res) => {
       res.resume();
     }).on('error', (err) => {
       logger.warn(`[index] Self-ping failed: ${err.message}`);
     });
   }, PING_INTERVAL_MS);
 
-  logger.info(`[index] Self-ping started — hitting ${pingUrl} every ${PING_INTERVAL_MS / 1000}s`);
+  logger.info(
+    `[index] Self-ping started — hitting ${pingUrl} every ${PING_INTERVAL_MS / 1000}s`
+  );
 }
 
 async function main() {
