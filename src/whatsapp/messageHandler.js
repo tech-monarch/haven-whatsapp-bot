@@ -37,12 +37,13 @@ function checkRateLimit(phoneNumber) {
 const COMMANDS = {
   '/help': async (sock, jid) => {
     await safeSend(sock, jid,
-      `*Haven Bot — Help* 🛠️\n\n` +
-      `Just tell me what you need and where:\n` +
+      `*Haven Community Bot* 🙏\n\n` +
+      `Haven connects you to skilled, trusted members of your church community.\n\n` +
+      `Just describe what you need and where:\n` +
       `_"I need a plumber in Lekki"_\n` +
       `_"Find an electrician near Wuse 2 urgently"_\n\n` +
       `*Other commands:*\n` +
-      `/services — see all available categories\n` +
+      `/services — see all available skill categories\n` +
       `/reset — start the conversation over\n` +
       `/help — show this message`
     );
@@ -53,25 +54,25 @@ const COMMANDS = {
       const categories = await artisanService.listCategories();
       const list = categories.map(c => `• ${c.charAt(0).toUpperCase() + c.slice(1)}`).join('\n');
       await safeSend(sock, jid,
-        `*Available services* 🔧\n\n${list}\n\n` +
-        `Just tell me which one you need and your area!`
+        `*Skills available in your community* 🔧\n\n${list}\n\n` +
+        `Tell me which skill you need and your area, and I'll connect you to a trusted community member!`
       );
     } catch (err) {
-      await safeSend(sock, jid, 'Sorry, I couldn\'t load the service list right now. Try again in a moment.');
+      await safeSend(sock, jid, 'Sorry, I couldn\'t load the services list right now. Please try again in a moment. 🙏');
     }
   },
 
   '/reset': async (sock, jid, phoneNumber) => {
     session.clearSession(phoneNumber);
     await safeSend(sock, jid,
-      `Conversation reset ✅\n\nFresh start! What service do you need, and which area are you in?`
+      `Conversation reset ✅\n\nFresh start! What do you need help with, and which area are you in? 🙏`
     );
   },
 
   'start over': async (sock, jid, phoneNumber) => {
     session.clearSession(phoneNumber);
     await safeSend(sock, jid,
-      `No problem — let's start over! What service do you need, and which area are you in?`
+      `No worries — let's start fresh! What do you need, and which area are you in? 🙏`
     );
   },
 };

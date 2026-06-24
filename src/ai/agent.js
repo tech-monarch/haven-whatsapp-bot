@@ -31,12 +31,13 @@ function buildConnectReply(artisan, userName) {
   const avail     = artisan.available ? '✅ Available now' : '🕒 Currently unavailable';
   const phone     = artisan.phone || 'not listed';
   return (
-    `${greeting}reat choice! Here are *${artisan.name}*'s details:\n\n` +
+    `${greeting}reat — here are *${artisan.name}*'s details:\n\n` +
     `📞 *${phone}*\n` +
     `📍 ${artisan.location}\n` +
-    `⭐ ${artisan.rating} rating | ${artisan.completed_jobs} jobs\n` +
+    `⭐ ${artisan.rating} rating | ${artisan.completed_jobs} jobs completed\n` +
     `${avail}\n\n` +
-    `You can call or WhatsApp them directly. Let me know if you'd like to see other options! 🙏`
+    `You can reach them directly by call or WhatsApp. 🙏\n` +
+    `Let me know if you'd like to see other options or need anything else!`
   );
 }
 
@@ -47,13 +48,14 @@ function buildConnectReply(artisan, userName) {
 function buildGreetingReply(userName) {
   const name = userName ? `, ${userName}` : '';
   return (
-    `Hi${name}! 👋 I'm the *Haven* bot — I help you find trusted artisans nearby.\n\n` +
-    `I can find you:\n` +
+    `Hi${name}! 🙏 Welcome to *Haven* — your church community's helping hand.\n\n` +
+    `We connect members to trusted, skilled people within the community. Whether you need:\n\n` +
     `🔌 Electricians  🔧 Plumbers\n` +
     `🚗 Mechanics  🧹 Cleaners\n` +
     `❄️ Technicians  🪵 Carpenters  🎨 Painters\n\n` +
-    `Just tell me *what service you need* and *your area*, and I'll find the best options for you!\n\n` +
-    `_Type /help anytime for more options._`
+    `…or someone to lend a hand with something else entirely — we're here.\n\n` +
+    `Just tell me *what you need* and *your area*, and I'll find the right person in your community!\n\n` +
+    `_Type /help anytime to see all options._`
   );
 }
 
