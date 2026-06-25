@@ -15,7 +15,7 @@ const { resolveUser }       = require('../api/roleResolver');
 const session               = require('./session');
 const logger                = require('../config/logger');
 
-// ─── Deduplication ────────────────────────────────────────────────────────────
+// ─── Deduplication ───────────────────────────────────────────────────────────
 // Keep the last 500 processed message IDs in a bounded Set to prevent
 // duplicate processing when WhatsApp re-delivers messages.
 const MAX_SEEN = 500;
