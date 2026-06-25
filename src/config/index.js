@@ -15,7 +15,7 @@ module.exports = {
   },
 
   whatsapp: {
-    phoneNumber: process.env.BOT_PHONE_NUMBER ?? '',
+    phoneNumber: process.env.WA_PHONE_NUMBER ?? process.env.BOT_PHONE_NUMBER ?? '',
     adminNumbers: (process.env.ADMIN_NUMBERS ?? '').split(',').map(s => s.trim()).filter(Boolean),
   },
 

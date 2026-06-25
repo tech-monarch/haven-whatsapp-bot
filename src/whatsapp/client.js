@@ -58,11 +58,18 @@ async function connectToWhatsApp() {
 
   // Pairing code for phone-based auth
   if (!sock.authState.creds.registered) {
-    const phone = process.env.BOT_PHONE_NUMBER;
+    const phone = process.env.WA_PHONE_NUMBER || process.env.BOT_PHONE_NUMBER;
     if (phone) {
-      await sock.waitForConnectionUpdate(u => !!u.qr);
+      // Wait briefly for the socket to be ready before requesting the pairing code
+      await new Promise(resolve => setTimeout(resolve, 3000));
       const code = await sock.requestPairingCode(phone.replace(/\D/g, ''));
-      logger.info(`[client] Pairing code: ${code}`);
+      logger.info(`[client] ✅ Pairing code: ${code}`);
+      console.log(`\n========================================`);
+      console.log(`   WHATSAPP PAIRING CODE: ${code}`);
+      console.log(`========================================\n`);
+      console.log(`Open WhatsApp > Linked Devices > Link a Device > Link with phone number`);
+    } else {
+      logger.warn('[client] No phone number set. Set WA_PHONE_NUMBER in your .env file to get a pairing code.');
     }
   }
 
