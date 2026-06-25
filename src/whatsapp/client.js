@@ -39,6 +39,9 @@ async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const { version }          = await fetchLatestBaileysVersion();
 
+  // Check if already registered BEFORE creating the socket, so we can set mobile:true
+  const usePairingCode = !state.creds.registered;
+
   const sock = makeWASocket({
     version,
     auth: {
@@ -47,6 +50,8 @@ async function connectToWhatsApp() {
     },
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
+    // mobile:true is required for pairing code auth to work
+    mobile: usePairingCode,
     browser: ['Haven Bot', 'Chrome', '120.0.0'],
     generateHighQualityLinkPreview: false,
     syncFullHistory: false,
@@ -57,19 +62,41 @@ async function connectToWhatsApp() {
   activeSock = sock;
 
   // Pairing code for phone-based auth
-  if (!sock.authState.creds.registered) {
+  if (usePairingCode) {
     const phone = process.env.WA_PHONE_NUMBER || process.env.BOT_PHONE_NUMBER;
     if (phone) {
-      // Wait briefly for the socket to be ready before requesting the pairing code
-      await new Promise(resolve => setTimeout(resolve, 3000));
-      const code = await sock.requestPairingCode(phone.replace(/\D/g, ''));
-      logger.info(`[client] ✅ Pairing code: ${code}`);
-      console.log(`\n========================================`);
-      console.log(`   WHATSAPP PAIRING CODE: ${code}`);
-      console.log(`========================================\n`);
-      console.log(`Open WhatsApp > Linked Devices > Link a Device > Link with phone number`);
+      // Wait for the socket to reach the 'connecting' state before requesting the code
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Timed out waiting for socket to be ready')), 15000);
+        sock.ev.on('connection.update', (update) => {
+          if (update.connection === 'connecting' || update.qr !== undefined) {
+            clearTimeout(timeout);
+            resolve();
+          }
+        });
+      }).catch(err => {
+        logger.warn(`[client] ${err.message} — attempting pairing code anyway`);
+      });
+
+      try {
+        const cleanPhone = phone.replace(/\D/g, '');
+        logger.info(`[client] Requesting pairing code for +${cleanPhone}…`);
+        const code = await sock.requestPairingCode(cleanPhone);
+        logger.info(`[client] ✅ Pairing code: ${code}`);
+        console.log(`\n========================================`);
+        console.log(`   WHATSAPP PAIRING CODE: ${code}`);
+        console.log(`========================================`);
+        console.log(`On your phone: WhatsApp > Settings > Linked Devices > Link a Device`);
+        console.log(`Then tap "Link with phone number instead" and enter the code above.\n`);
+      } catch (err) {
+        logger.error(`[client] Failed to get pairing code: ${err.message}`);
+        console.error('\n❌ Could not get pairing code. Check that:');
+        console.error('   1. WA_PHONE_NUMBER in .env is correct (digits only, with country code, e.g. 2348012345678)');
+        console.error('   2. That number is registered on WhatsApp');
+        console.error('   3. You deleted the whatsapp-session/ folder before retrying\n');
+      }
     } else {
-      logger.warn('[client] No phone number set. Set WA_PHONE_NUMBER in your .env file to get a pairing code.');
+      logger.warn('[client] No phone number set. Add WA_PHONE_NUMBER to your .env file.');
     }
   }
 
