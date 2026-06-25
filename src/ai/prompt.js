@@ -1,125 +1,153 @@
-const SYSTEM_PROMPT = `You are Haven's community assistant on WhatsApp — a warm, trustworthy helper for church and faith communities.
+const CUSTOMER_SYSTEM = `You are Haven's WhatsApp assistant — a warm, efficient helper for service requests.
+Haven connects customers to trusted service providers (plumbers, electricians, cleaners, mechanics, etc.).
+Your job: understand what the customer needs, help them find providers, check their requests/bookings, and take actions.
+Rules:
+- Never invent data. Only use results given to you.
+- Keep replies short and clear — WhatsApp format (*bold*, _italic_, emojis, newlines).
+- Max 150 words per reply unless listing results.
+- Never claim to have booked or paid on the customer's behalf without confirmation.`;
 
-Haven is a faith-driven platform that helps church communities care for one another by connecting people's skills, needs, and opportunities — creating a stronger, self-supporting community.
+const PROVIDER_SYSTEM = `You are Haven's WhatsApp assistant for service providers (artisans).
+Haven connects providers to customers needing their services.
+Your job: help providers view jobs, update job status, and manage their bookings.
+Rules:
+- Keep replies short and clear — WhatsApp format.
+- Never invent job or customer data. Only use results given to you.
+- Max 150 words unless listing jobs.`;
 
-Your personality:
-- Warm, kind, and respectful — like a trusted church elder or deacon
-- Encouraging and uplifting without being preachy
-- Practical and clear — you get things done for people
-- You treat every community member with dignity
+const UNKNOWN_SYSTEM = `You are Haven's WhatsApp assistant.
+Haven is a service marketplace connecting customers to trusted providers in Nigeria.
+If the person is not registered, explain how to sign up and direct them to the Haven app.`;
 
-What you help with:
-- Connecting members to skilled people within the church community (artisans, professionals, volunteers)
-- Finding help for urgent needs (repairs, errands, care)
-- Surfacing opportunities to serve others in the community
-- Helping members support and be supported by their local church family
+function systemFor(role) {
+  if (role === 'CUSTOMER') return CUSTOMER_SYSTEM;
+  if (role === 'PROVIDER') return PROVIDER_SYSTEM;
+  return UNKNOWN_SYSTEM;
+}
 
-Rules you must always follow:
-- Never invent or fabricate member/service provider data. Only use results from the data given to you.
-- If no match is found, say so graciously and offer to help further.
-- Ask gentle, focused questions if the service or area is unclear.
-- Prioritise trustworthiness, ratings, and availability when recommending helpers.
-- Keep replies concise, warm, and easy to read on WhatsApp (short lines, tasteful emojis, no heavy markdown).
-- Never claim to have booked or contacted someone on the user's behalf — only share contact details.
-- If the user mentions their name, use it naturally and warmly.
-- Occasionally affirm the value of community and mutual support — but keep it natural, not forced.`;
+// ─── Intent extraction ────────────────────────────────────────────────────────
 
-// ---------------------------------------------------------------------------
-// Intent extraction
-// ---------------------------------------------------------------------------
-
-/**
- * Build the prompt that extracts structured intent from a raw user message.
- * Includes conversation history and the helpers shown in the last search
- * so the AI can resolve "connect me to number 2" accurately.
- */
-function buildExtractionPrompt(userMessage, conversationContext = [], prevPrefs = {}) {
-  const historyBlock = conversationContext.length
-    ? `Recent conversation (oldest to newest):\n${conversationContext
-        .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`)
-        .join('\n')}\n`
+function buildExtractionPrompt(userMessage, history = [], prevPrefs = {}, lastShownProviders = [], role = null) {
+  const histBlock = history.length
+    ? `Conversation history:\n${history.map(m => `${m.role === 'user' ? 'User' : 'Bot'}: ${m.text}`).join('\n')}\n`
     : '';
 
-  const lastArtisans = prevPrefs.lastShownArtisans || [];
-  const artisanBlock = lastArtisans.length
-    ? `Community helpers shown in the previous reply (for resolving "connect me to #N"):\n${lastArtisans
-        .map((a, i) => `${i + 1}. ${a.name} | ${a.category} | ${a.location}`)
-        .join('\n')}\n`
+  const shownBlock = lastShownProviders.length
+    ? `Providers shown in last reply:\n${lastShownProviders.map((p,i) => `${i+1}. ${p.businessName ?? p.name} | ${p.category} | ${p.location}`).join('\n')}\n`
     : '';
 
-  return `You extract structured intent from messages sent to Haven, a faith-community WhatsApp bot that connects church members to skilled helpers and services within their community.
+  const roleHint = role ? `User role: ${role}\n` : '';
 
-${historyBlock}${artisanBlock}
-New user message: "${userMessage}"
+  // Available actions depend on role
+  const actions = role === 'PROVIDER'
+    ? `"get_my_jobs","complete_job","start_job"`
+    : `"search_providers","get_my_requests","get_my_bookings","get_booking_detail","get_quotes","cancel_booking"`;
 
-Extract the following fields and respond with ONLY valid JSON, no markdown fences, no commentary:
+  return `${roleHint}${histBlock}${shownBlock}
+New message: "${userMessage}"
+
+Extract intent and respond ONLY with valid JSON (no markdown, no commentary):
 
 {
   "service": string|null,
   "location": string|null,
   "urgency": "low"|"normal"|"high",
   "budget": number|null,
-  "requirements": string|null,
-  "intent": "search_artisan"|"follow_up"|"greeting"|"connect_request"|"other",
+  "intent": "search_provider"|"check_status"|"connect_request"|"take_action"|"greeting"|"other",
   "missing_info": string[],
-  "selected_artisan_index": number|null,
-  "user_name": string|null
+  "selected_index": number|null,
+  "user_name": string|null,
+  "action": ${actions}|null,
+  "action_params": {}
 }
 
-Field notes:
-- "urgency": "high" if the user says urgent/now/emergency/asap/please help, else "normal"
-- "budget": numeric value in Naira if mentioned, else null
-- "intent": use "connect_request" when the user wants to be connected to or contact a helper
-- "selected_artisan_index": 1-based index if they say "number 1", "#2", "the first one", "option 3", etc. null otherwise
-- "user_name": their first name if they introduce themselves, e.g. "I'm Emeka" → "Emeka". null if not mentioned.
-- "missing_info": fields still needed before a search can run well, e.g. ["service"] or ["location"]. Empty if enough info is present.
-
+Notes:
+- "action": set if user wants to perform a platform action (e.g. "show my orders" → "get_my_bookings"; "complete job 12345" → "complete_job")
+- "action_params": include relevant IDs extracted from message (e.g. { "bookingId": "12345678" })
+- "selected_index": 1-based if user picks from a list ("the first one", "#2", etc.)
+- "urgency": "high" if user says urgent/emergency/asap
+- "missing_info": fields still needed (e.g. ["location"] if service known but location missing)
 Only output the JSON object.`;
 }
 
-// ---------------------------------------------------------------------------
-// Response generation
-// ---------------------------------------------------------------------------
+// ─── Response generation ──────────────────────────────────────────────────────
 
-/**
- * Build the prompt that turns ranked results into a natural WhatsApp reply.
- */
-function buildResponsePrompt({ userMessage, intent, artisans, usingDatabase, userName }) {
+function buildResponsePrompt({ userMessage, intent, providers, actionResult, userName, role }) {
+  const system = systemFor(role);
   const greeting = userName ? `, ${userName}` : '';
 
-  const artisanBlock = artisans.length
-    ? artisans
-        .slice(0, 5)
-        .map((a, i) => {
-          const avail = a.available ? 'Available now' : 'Currently unavailable';
-          return `${i + 1}. ${a.name} | skill: ${a.category} | rating: ${a.rating} | area: ${a.location} | ${avail} | avg response: ${a.average_response_time} mins | completed jobs: ${a.completed_jobs} | price range: ${a.price_range || 'flexible'}`;
-        })
-        .join('\n')
-    : 'No matching community helpers were found.';
+  let dataBlock = '';
 
-  return `${SYSTEM_PROMPT}
+  if (actionResult) {
+    if (actionResult.type === 'error') {
+      dataBlock = `Action failed: ${actionResult.message}`;
+    } else if (actionResult.type === 'requests') {
+      dataBlock = `Active service requests:\n${formatRequests(actionResult.data)}`;
+    } else if (actionResult.type === 'bookings') {
+      dataBlock = `Bookings:\n${formatBookings(actionResult.data)}`;
+    } else if (actionResult.type === 'jobs') {
+      dataBlock = `Provider jobs:\n${formatJobs(actionResult.data)}`;
+    } else if (actionResult.type === 'providers' || actionResult.type === 'quotes') {
+      dataBlock = `Available providers:\n${formatProviders(actionResult.data)}`;
+    } else if (actionResult.type === 'cancelled') {
+      dataBlock = `Booking successfully cancelled.`;
+    } else if (actionResult.type === 'completed') {
+      dataBlock = `Job successfully marked as completed.`;
+    } else if (actionResult.type === 'started') {
+      dataBlock = `Job successfully marked as in progress.`;
+    }
+  } else if (providers.length) {
+    dataBlock = `Matching providers:\n${formatProviders(providers)}`;
+  } else if (intent.service) {
+    dataBlock = `No providers found for "${intent.service}" in "${intent.location ?? 'the area'}"`;
+  }
 
-Data source note (do not mention this to the user): ${usingDatabase ? 'live database' : 'demo/mock dataset'}.
-User name if known: ${userName || 'unknown'}
+  return `${system}
 
-User's extracted intent: ${JSON.stringify(intent)}
-User's latest message: "${userMessage}"
+User message: "${userMessage}"
+Intent: ${JSON.stringify(intent)}
+Data: ${dataBlock || 'none'}
 
-Ranked community helpers (best match first — do NOT re-rank or invent anyone not listed here):
-${artisanBlock}
-
-Write a short, warm WhatsApp reply to the user${greeting ? ` (address them warmly as ${userName})` : ''} that:
-- If intent.missing_info is non-empty, ask ONE gentle, clear follow-up question for the most important missing field.
-- Otherwise, present up to the top 3 helpers using a clean format: name, skill, rating, area, availability.
-- End by asking if they'd like to be connected to one of them.
-- Keep the tone warm and community-spirited — like a helpful church notice board, not a cold marketplace.
-- Do not use markdown headers or backticks. WhatsApp supports *bold* and _italic_ and emojis.
-- Keep it under 130 words.`;
+Write a short WhatsApp reply${greeting ? ` to ${userName}` : ''}:
+- Present data clearly if provided.
+- If missing_info is non-empty, ask for ONE missing field.
+- If providers are listed, show top 3 with name, rating, location, phone.
+- End with a clear next step.
+- Use *bold*, emojis, line breaks. Max 150 words.`;
 }
 
+// ─── Format helpers ───────────────────────────────────────────────────────────
+
+function fmt(n) { return Number(n).toLocaleString('en-NG'); }
+function date(d) { return d ? new Date(d).toLocaleDateString('en-NG', { day:'numeric', month:'short' }) : '—'; }
+
+function formatProviders(providers = []) {
+  return providers.slice(0, 5).map((p, i) =>
+    `${i+1}. ${p.businessName} | ⭐${Number(p.avgRating ?? p.rating ?? 0).toFixed(1)} | 📍${p.location} | 📞${p.phone}`
+  ).join('\n');
+}
+
+function formatRequests(reqs = []) {
+  return reqs.slice(0, 5).map((r, i) =>
+    `${i+1}. ${r.category} | ${r.status} | ${date(r.preferredDate)} | ${r.address}`
+  ).join('\n');
+}
+
+function formatBookings(bookings = []) {
+  return bookings.slice(0, 5).map((b, i) =>
+    `${i+1}. ${b.provider?.businessName} | ${b.status} | ₦${fmt(b.amount)} | ${date(b.scheduledAt)}`
+  ).join('\n');
+}
+
+function formatJobs(jobs = []) {
+  return jobs.slice(0, 8).map((b, i) =>
+    `${i+1}. ${b.customer?.fullName} | ${b.serviceRequest?.category} | ${b.status} | ₦${fmt(b.amount)} | ID:${b.id?.slice(0,8)}`
+  ).join('\n');
+}
 
 module.exports = {
-  SYSTEM_PROMPT,
   buildExtractionPrompt,
   buildResponsePrompt,
+  CUSTOMER_SYSTEM,
+  PROVIDER_SYSTEM,
 };

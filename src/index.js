@@ -1,85 +1,119 @@
-const http = require('http');
-const https = require('https');
-const config = require('./config');
-const logger = require('./config/logger');
-const artisanService = require('./artisans/artisanService');
-const { startWhatsApp } = require('./whatsapp/client');
-const { handleIncomingMessage } = require('./whatsapp/messageHandler');
+/**
+ * Haven WhatsApp Bot — entry point.
+ *
+ * Starts:
+ * 1. HTTP server on PORT (health check + /send endpoint for backend notifications)
+ * 2. WhatsApp connection
+ */
 
-let isReady = false;
+require('dotenv').config();
 
-function startHealthServer() {
-  const server = http.createServer((req, res) => {
-    if (req.url === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          status: isReady ? 'ok' : 'starting',
-          databaseMode: artisanService.isUsingDatabase() ? 'postgres' : 'mock',
-        })
-      );
+const http       = require('http');
+const { connectToWhatsApp, getSock } = require('./whatsapp/client');
+const logger     = require('./config/logger');
+const { getHealthStatus } = require('./ai/providerManager');
+
+const PORT = parseInt(process.env.PORT ?? '3000', 10);
+const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY ?? '';
+
+// ─── HTTP server ──────────────────────────────────────────────────────────────
+
+const server = http.createServer(async (req, res) => {
+  const url    = req.url ?? '/';
+  const method = req.method ?? 'GET';
+
+  // ── Health ──────────────────────────────────────────────────────────────
+  if (method === 'GET' && url === '/health') {
+    const aiHealth = getHealthStatus();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'ok',
+      service: 'haven-bot',
+      aiKeys: aiHealth,
+      timestamp: new Date().toISOString(),
+    }));
+    return;
+  }
+
+  // ── Send WhatsApp message (backend → bot) ────────────────────────────────
+  if (method === 'POST' && url === '/send') {
+    // Authenticate
+    const key = req.headers['x-internal-key'];
+    if (INTERNAL_API_KEY && key !== INTERNAL_API_KEY) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' }));
       return;
     }
-    res.writeHead(404);
-    res.end();
-  });
-  server.listen(config.port, () => {
-    logger.info(`[index] Health check server listening on port ${config.port} (GET /health)`);
-    startSelfPing();
-  });
-}
 
-// ---------------------------------------------------------------------------
-// Self-ping — hits our own /health endpoint every 10 s to prevent the server
-// from hibernating on platforms like Render's free tier.
-// ---------------------------------------------------------------------------
-function startSelfPing() {
-  const PING_INTERVAL_MS = 10_000;
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const { to, text } = JSON.parse(body);
+        if (!to || !text) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: 'to and text are required' }));
+          return;
+        }
 
-  const baseUrl =
-    process.env.RENDER_EXTERNAL_URL ||
-    `http://localhost:${config.port}`;
+        const sock = getSock();
+        if (!sock) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: 'WhatsApp not connected' }));
+          return;
+        }
 
-  const pingUrl = `${baseUrl}/health`;
+        // Normalize JID
+        const phone = String(to).replace(/[\s\-()]/g, '').replace(/^\+/, '');
+        const jid   = phone.includes('@') ? phone : `${phone}@s.whatsapp.net`;
 
-  const client = pingUrl.startsWith('https://') ? https : http;
+        await sock.sendMessage(jid, { text });
 
-  setInterval(() => {
-    client.get(pingUrl, (res) => {
-      res.resume();
-    }).on('error', (err) => {
-      logger.warn(`[index] Self-ping failed: ${err.message}`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
+      } catch (err) {
+        logger.error('[/send] Error:', err.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: err.message }));
+      }
     });
-  }, PING_INTERVAL_MS);
+    return;
+  }
 
-  logger.info(
-    `[index] Self-ping started — hitting ${pingUrl} every ${PING_INTERVAL_MS / 1000}s`
-  );
-}
+  // ── 404 ──────────────────────────────────────────────────────────────────
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ success: false, message: 'Not found' }));
+});
 
-async function main() {
-  logger.info('[index] Booting WhatsApp Artisan Bot...');
+server.listen(PORT, () => {
+  logger.info(`[index] HTTP server listening on port ${PORT}`);
+});
 
-  await artisanService.init();
-  startHealthServer();
+// ─── WhatsApp ─────────────────────────────────────────────────────────────────
 
-  await startWhatsApp(
-    (sock) => {
-      isReady = true;
-      logger.info('[index] WhatsApp client is ready to receive messages.');
-    },
-    handleIncomingMessage
-  );
-
-  process.on('unhandledRejection', (err) => {
-    logger.error('[index] Unhandled rejection:', err);
-  });
-  process.on('uncaughtException', (err) => {
-    logger.error('[index] Uncaught exception:', err);
-  });
-}
-
-main().catch((err) => {
-  logger.error('[index] Fatal error during startup:', err);
+connectToWhatsApp().catch(err => {
+  logger.error('[index] Failed to connect to WhatsApp:', err.message);
   process.exit(1);
+});
+
+// ─── Graceful shutdown ────────────────────────────────────────────────────────
+
+async function shutdown(signal) {
+  logger.info(`[index] Received ${signal} — shutting down gracefully…`);
+  server.close(() => {
+    logger.info('[index] HTTP server closed');
+    process.exit(0);
+  });
+  // Give in-flight messages 5s to complete
+  setTimeout(() => process.exit(0), 5_000);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('uncaughtException', (err) => {
+  logger.error('[index] Uncaught exception:', err.message, err.stack);
+  // Don't exit — the bot must stay alive
+});
+process.on('unhandledRejection', (reason) => {
+  logger.error('[index] Unhandled rejection:', reason);
 });

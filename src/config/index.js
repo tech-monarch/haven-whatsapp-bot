@@ -1,54 +1,28 @@
 require('dotenv').config();
 
-const required = (name, fallback = undefined) => {
-  const value = process.env[name];
-  if (value === undefined || value === '') return fallback;
-  return value;
-};
-
-const config = {
-  port: parseInt(required('PORT', '3000'), 10),
-  logLevel: required('LOG_LEVEL', 'info'),
+module.exports = {
+  port: parseInt(process.env.PORT ?? '3000', 10),
 
   gemini: {
-    apiKey: required('GEMINI_API_KEY', ''),
-    model: required('GEMINI_MODEL', 'gemini-1.5-flash'),
+    // Legacy single key — still supported as fallback.
+    // Prefer GEMINI_API_KEY_1 / GEMINI_API_KEY_2 going forward.
+    apiKey: process.env.GEMINI_API_KEY ?? process.env.GEMINI_API_KEY_1 ?? '',
+    model:  process.env.GEMINI_MODEL ?? 'gemini-1.5-flash',
   },
 
   database: {
-    url: required('DATABASE_URL', ''),
-    // true => real PostgreSQL backend is available, false => use mock data
-    enabled: Boolean(required('DATABASE_URL', '')),
+    url: process.env.DATABASE_URL ?? '',
   },
 
   whatsapp: {
-    authDir: required('WA_AUTH_DIR', 'auth_sessions'),
-    ignoreGroups: true,
-    // Phone number in international format WITHOUT the leading '+'.
-    // Example: 2349067296455  (234 = Nigeria country code)
-    // Set WA_PHONE_NUMBER in your .env — do NOT hardcode it here.
-    phoneNumber: required('WA_PHONE_NUMBER', ''),
+    phoneNumber: process.env.BOT_PHONE_NUMBER ?? '',
+    adminNumbers: (process.env.ADMIN_NUMBERS ?? '').split(',').map(s => s.trim()).filter(Boolean),
   },
 
-  admins: (required('ADMIN_NUMBERS', '') || '')
-    .split(',')
-    .map((n) => n.trim())
-    .filter(Boolean),
+  backend: {
+    baseUrl:       process.env.BACKEND_BASE_URL ?? 'http://localhost:3001',
+    internalApiKey: process.env.INTERNAL_API_KEY ?? '',
+  },
+
+  isDev: (process.env.NODE_ENV ?? 'development') === 'development',
 };
-
-if (!config.gemini.apiKey) {
-  // eslint-disable-next-line no-console
-  console.warn(
-    '[config] WARNING: GEMINI_API_KEY is not set. The AI agent will not be able to call Gemini until you set it in .env'
-  );
-}
-
-module.exports = config;
-
-if (!config.whatsapp.phoneNumber) {
-  // eslint-disable-next-line no-console
-  console.warn(
-    '[config] WARNING: WA_PHONE_NUMBER is not set. Pairing code auth will fail on first login. ' +
-    'Set it in .env as digits only, no + (e.g. WA_PHONE_NUMBER=2349067296455).'
-  );
-}

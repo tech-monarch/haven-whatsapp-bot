@@ -1,169 +1,138 @@
-const { extractTextFromMessage } = require('./client');
-const agent = require('../ai/agent');
-const session = require('./session');
-const artisanService = require('../artisans/artisanService');
-const logger = require('../config/logger');
-
-const TYPING_DELAY_MS   = 600;
-const MAX_MESSAGE_LENGTH = 2000;
-
-// -------------------------------------------------------------------------
-// Rate limiting — sliding window per user
-// Max 12 messages per 60 seconds. Warn the user at 10.
-// -------------------------------------------------------------------------
-const rateLimitWindows = new Map(); // phoneNumber -> timestamp[]
-const RATE_LIMIT_MAX     = 12;
-const RATE_LIMIT_WARN_AT = 10;
-const RATE_LIMIT_WINDOW  = 60_000; // 1 minute
-
 /**
- * Returns 'ok' | 'warn' | 'block'
+ * Message handler — entry point for every incoming WhatsApp message.
+ *
+ * Pipeline:
+ * 1. Deduplicate (ignore already-processed message IDs)
+ * 2. Rate limit (per phone number)
+ * 3. Resolve user role (from session cache → backend API)
+ * 4. Try command dispatch (zero AI cost)
+ * 5. Fall through to AI agent
  */
-function checkRateLimit(phoneNumber) {
+
+const { handleUserMessage } = require('../ai/agent');
+const { dispatch }          = require('../commands/registry');
+const { resolveUser }       = require('../api/roleResolver');
+const session               = require('./session');
+const logger                = require('../config/logger');
+
+// ─── Deduplication ────────────────────────────────────────────────────────────
+// Keep the last 500 processed message IDs in a bounded Set to prevent
+// duplicate processing when WhatsApp re-delivers messages.
+const MAX_SEEN = 500;
+const seenMessageIds = new Set();
+
+function markSeen(id) {
+  if (seenMessageIds.size >= MAX_SEEN) {
+    // Remove the oldest entry
+    seenMessageIds.delete(seenMessageIds.values().next().value);
+  }
+  seenMessageIds.add(id);
+}
+
+// ─── Per-phone rate limiting ──────────────────────────────────────────────────
+const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
+const RATE_LIMIT_MAX       = 15;     // messages per window
+
+const rateLimitWindows = new Map(); // phone → { count, windowStart }
+
+function isRateLimited(phone) {
   const now = Date.now();
-  const prev = (rateLimitWindows.get(phoneNumber) || []).filter(t => now - t < RATE_LIMIT_WINDOW);
-  prev.push(now);
-  rateLimitWindows.set(phoneNumber, prev);
-
-  if (prev.length > RATE_LIMIT_MAX)  return 'block';
-  if (prev.length >= RATE_LIMIT_WARN_AT) return 'warn';
-  return 'ok';
+  const w   = rateLimitWindows.get(phone);
+  if (!w || now - w.windowStart > RATE_LIMIT_WINDOW_MS) {
+    rateLimitWindows.set(phone, { count: 1, windowStart: now });
+    return false;
+  }
+  w.count++;
+  if (w.count > RATE_LIMIT_MAX) return true;
+  return false;
 }
 
-// ---------------------------------------------------------------------------
-// Commands — handled before the AI pipeline (no Gemini call)
-// ---------------------------------------------------------------------------
-
-const COMMANDS = {
-  '/help': async (sock, jid) => {
-    await safeSend(sock, jid,
-      `*Haven Community Bot* 🙏\n\n` +
-      `Haven connects you to skilled, trusted members of your church community.\n\n` +
-      `Just describe what you need and where:\n` +
-      `_"I need a plumber in Lekki"_\n` +
-      `_"Find an electrician near Wuse 2 urgently"_\n\n` +
-      `*Other commands:*\n` +
-      `/services — see all available skill categories\n` +
-      `/reset — start the conversation over\n` +
-      `/help — show this message`
-    );
-  },
-
-  '/services': async (sock, jid) => {
-    try {
-      const categories = await artisanService.listCategories();
-      const list = categories.map(c => `• ${c.charAt(0).toUpperCase() + c.slice(1)}`).join('\n');
-      await safeSend(sock, jid,
-        `*Skills available in your community* 🔧\n\n${list}\n\n` +
-        `Tell me which skill you need and your area, and I'll connect you to a trusted community member!`
-      );
-    } catch (err) {
-      await safeSend(sock, jid, 'Sorry, I couldn\'t load the services list right now. Please try again in a moment. 🙏');
-    }
-  },
-
-  '/reset': async (sock, jid, phoneNumber) => {
-    session.clearSession(phoneNumber);
-    await safeSend(sock, jid,
-      `Conversation reset ✅\n\nFresh start! What do you need help with, and which area are you in? 🙏`
-    );
-  },
-
-  'start over': async (sock, jid, phoneNumber) => {
-    session.clearSession(phoneNumber);
-    await safeSend(sock, jid,
-      `No worries — let's start fresh! What do you need, and which area are you in? 🙏`
-    );
-  },
-};
-
-// ---------------------------------------------------------------------------
-// Main handler
-// ---------------------------------------------------------------------------
-
-async function handleIncomingMessage(sock, msg) {
-  const remoteJid   = msg.key.remoteJid;
-  const phoneNumber = remoteJid?.split('@')[0];
-
-  if (!phoneNumber) {
-    logger.warn('[messageHandler] Could not determine sender phone number, skipping.');
-    return;
-  }
-
-  // Mark as read so the user sees the double blue tick
-  try {
-    await sock.readMessages([msg.key]);
-  } catch (_) {
-    // Non-critical — don't crash if this fails
-  }
-
-  const text = extractTextFromMessage(msg);
-
-  if (!text) {
-    await safeSend(
-      sock, remoteJid,
-      "I can only read text messages for now 🙏 — please describe what service you need in words.\n\n_Type /help to see what I can do._"
-    );
-    return;
-  }
-
-  if (text.length > MAX_MESSAGE_LENGTH) {
-    await safeSend(sock, remoteJid, 'That message is a bit long — could you summarize what you need?');
-    return;
-  }
-
-  // -- Rate limiting --------------------------------------------------------
-  const rateStatus = checkRateLimit(phoneNumber);
-  if (rateStatus === 'block') {
-    await safeSend(
-      sock, remoteJid,
-      "You're sending messages very quickly 😅. Please wait a minute and try again."
-    );
-    return;
-  }
-  if (rateStatus === 'warn') {
-    // Don't block — just slip a note into the reply later; handled below
-    logger.warn(`[messageHandler] User ${phoneNumber} approaching rate limit`);
-  }
-
-  // -- Command detection ----------------------------------------------------
-  const normalizedText = text.trim().toLowerCase();
-  for (const [trigger, handler] of Object.entries(COMMANDS)) {
-    if (normalizedText === trigger || normalizedText.startsWith(trigger + ' ')) {
-      await handler(sock, remoteJid, phoneNumber);
-      return;
-    }
-  }
-
-  // -- AI pipeline ----------------------------------------------------------
-  try {
-    await sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
-
-    const reply = await agent.handleUserMessage(phoneNumber, text);
-
-    await new Promise((resolve) => setTimeout(resolve, TYPING_DELAY_MS));
-
-    // Append rate-limit warning if approaching limit
-    const finalReply = rateStatus === 'warn'
-      ? reply + '\n\n_Note: you\'re sending messages quite fast — please slow down a little._'
-      : reply;
-
-    await safeSend(sock, remoteJid, finalReply);
-  } catch (err) {
-    logger.error(`[messageHandler] Failed to process message from ${phoneNumber}:`, err.message);
-    await safeSend(
-      sock, remoteJid,
-      'Something went wrong on my end 😕. Please try again in a moment.'
-    );
-  }
+// ─── Helper ───────────────────────────────────────────────────────────────────
+function extractPhone(jid) {
+  // JID format: 2348012345678@s.whatsapp.net
+  return jid.split('@')[0].replace(/[^0-9]/g, '');
 }
 
-async function safeSend(sock, jid, text) {
+async function safeSendText(sock, jid, text) {
   try {
+    // Typing indicator
+    await sock.sendPresenceUpdate('composing', jid).catch(() => {});
+    // Small realistic delay
+    await new Promise(r => setTimeout(r, Math.min(text.length * 12, 2500)));
+    await sock.sendPresenceUpdate('paused', jid).catch(() => {});
     await sock.sendMessage(jid, { text });
   } catch (err) {
-    logger.error(`[messageHandler] Failed to send message to ${jid}:`, err.message);
+    logger.error('[messageHandler] safeSendText failed:', err.message);
   }
 }
 
-module.exports = { handleIncomingMessage };
+// ─── Main handler ─────────────────────────────────────────────────────────────
+
+async function handleMessage(sock, msg) {
+  try {
+    // 1. Basic extraction
+    const jid         = msg.key.remoteJid;
+    const messageId   = msg.key.id;
+    const fromMe      = msg.key.fromMe;
+
+    // Ignore outbound messages and status updates
+    if (fromMe || jid === 'status@broadcast') return;
+
+    const content = msg.message?.conversation
+      ?? msg.message?.extendedTextMessage?.text
+      ?? msg.message?.imageMessage?.caption
+      ?? null;
+
+    if (!content || !content.trim()) return;
+
+    // 2. Deduplicate
+    if (seenMessageIds.has(messageId)) {
+      logger.debug('[messageHandler] Duplicate message ignored:', messageId);
+      return;
+    }
+    markSeen(messageId);
+
+    const phoneNumber = extractPhone(jid);
+    const text        = content.trim();
+
+    logger.info(`[messageHandler] Message from ${phoneNumber}: "${text.slice(0, 80)}"`);
+
+    // 3. Rate limit
+    if (isRateLimited(phoneNumber)) {
+      logger.warn(`[messageHandler] Rate limit hit for ${phoneNumber}`);
+      await safeSendText(sock, jid,
+        `⚠️ You're sending messages too fast.\nPlease wait a moment before trying again. 🙏`
+      );
+      return;
+    }
+
+    // 4. Mark as read
+    await sock.readMessages([msg.key]).catch(() => {});
+
+    // 5. Resolve user role
+    const user = await resolveUser(phoneNumber);
+
+    // 6. Try command dispatch (no AI cost for known commands)
+    const handled = await dispatch(sock, jid, phoneNumber, text, user);
+    if (handled) return;
+
+    // 7. AI agent
+    const reply = await handleUserMessage(phoneNumber, text, user);
+    await safeSendText(sock, jid, reply);
+
+  } catch (err) {
+    logger.error('[messageHandler] Unhandled error:', err.message, err.stack);
+    try {
+      const jid = msg?.key?.remoteJid;
+      if (jid) {
+        await sock.sendMessage(jid, {
+          text: `Something went wrong on my end 🙏. Please try again in a moment.`,
+        });
+      }
+    } catch {
+      // last resort — swallow
+    }
+  }
+}
+
+module.exports = { handleMessage };

@@ -1,73 +1,158 @@
 /**
- * In-memory conversation memory, keyed by phone number.
+ * Session store — PostgreSQL-backed via the BotSession Prisma model.
+ * Falls back to in-memory if DB is unavailable (e.g. dev without DB).
  *
- * Structure:
- * {
- *   [phoneNumber]: {
- *     messages: [{ role: 'user'|'assistant', text: string, at: ISOString }],
- *     userPreferences: {
- *       lastService, lastLocation, lastBudget,
- *       lastShownArtisans,   // artisans shown in the previous search result
- *       userName,            // captured from conversation
- *     }
- *   }
- * }
- *
- * Deliberately behind a small interface so swapping to a persistent store
- * (Postgres/Redis) only requires rewriting this file.
+ * The interface is async throughout so the caller never needs to know
+ * whether it's hitting the DB or an in-memory Map.
  */
 
-const MAX_MESSAGES_PER_USER = 20;
+const logger = require('../config/logger');
 
-const store = new Map();
+// ─── In-memory fallback ───────────────────────────────────────────────────────
+const MAX_IN_MEMORY = 20;
+const memoryStore = new Map();
 
-function getSession(phoneNumber) {
-  if (!store.has(phoneNumber)) {
-    store.set(phoneNumber, { messages: [], userPreferences: {} });
+function getMemory(phoneNumber) {
+  if (!memoryStore.has(phoneNumber)) {
+    memoryStore.set(phoneNumber, { messages: [], preferences: {} });
   }
-  return store.get(phoneNumber);
+  return memoryStore.get(phoneNumber);
 }
 
-function appendMessage(phoneNumber, role, text) {
-  const session = getSession(phoneNumber);
-  session.messages.push({ role, text, at: new Date().toISOString() });
-  if (session.messages.length > MAX_MESSAGES_PER_USER) {
-    session.messages.splice(0, session.messages.length - MAX_MESSAGES_PER_USER);
+// ─── DB layer (lazy-loaded to avoid circular imports) ─────────────────────────
+let db = null;
+let dbAvailable = false;
+
+async function getDb() {
+  if (db) return db;
+  try {
+    db = require('../database/postgres');
+    await db.ensureBotSchema();
+    dbAvailable = true;
+    logger.info('[session] Using PostgreSQL-backed sessions');
+  } catch (err) {
+    logger.warn('[session] DB unavailable — using in-memory sessions:', err.message);
+    db = null;
+    dbAvailable = false;
   }
-  return session;
+  return db;
 }
 
-function getRecentMessages(phoneNumber, count = 6) {
-  return getSession(phoneNumber).messages.slice(-count);
+// ─── Internal DB helpers ──────────────────────────────────────────────────────
+
+async function dbGet(phoneNumber) {
+  const d = await getDb();
+  if (!dbAvailable || !d) return null;
+  try {
+    const { rows } = await d.query(
+      'SELECT messages, preferences FROM bot_sessions WHERE phone_number = $1',
+      [phoneNumber]
+    );
+    return rows[0] ?? null;
+  } catch (err) {
+    logger.warn('[session] dbGet failed:', err.message);
+    return null;
+  }
 }
 
-function setPreferences(phoneNumber, partialPrefs) {
-  const session = getSession(phoneNumber);
-  session.userPreferences = { ...session.userPreferences, ...partialPrefs };
-  return session.userPreferences;
+async function dbSave(phoneNumber, messages, preferences) {
+  const d = await getDb();
+  if (!dbAvailable || !d) return;
+  try {
+    await d.query(
+      `INSERT INTO bot_sessions (phone_number, messages, preferences, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (phone_number)
+       DO UPDATE SET messages = $2, preferences = $3, updated_at = NOW()`,
+      [phoneNumber, JSON.stringify(messages), JSON.stringify(preferences)]
+    );
+  } catch (err) {
+    logger.warn('[session] dbSave failed:', err.message);
+  }
 }
 
-function getPreferences(phoneNumber) {
-  return getSession(phoneNumber).userPreferences;
+async function dbDelete(phoneNumber) {
+  const d = await getDb();
+  if (!dbAvailable || !d) return;
+  try {
+    await d.query('DELETE FROM bot_sessions WHERE phone_number = $1', [phoneNumber]);
+  } catch (err) {
+    logger.warn('[session] dbDelete failed:', err.message);
+  }
 }
 
-function clearSession(phoneNumber) {
-  store.delete(phoneNumber);
+// ─── Public interface ─────────────────────────────────────────────────────────
+
+async function getSession(phoneNumber) {
+  const row = await dbGet(phoneNumber);
+  if (row) {
+    return {
+      messages:    Array.isArray(row.messages)    ? row.messages    : [],
+      preferences: typeof row.preferences === 'object' ? row.preferences : {},
+    };
+  }
+  return getMemory(phoneNumber);
 }
 
-/**
- * Store the artisans shown in the last search result so that a follow-up
- * "connect me to #2" can resolve the selection without another search.
- *
- * @param {string} phoneNumber
- * @param {object[]} artisans - the ranked list that was presented to the user
- */
-function setLastShownArtisans(phoneNumber, artisans) {
-  setPreferences(phoneNumber, { lastShownArtisans: artisans.slice(0, 5) });
+async function appendMessage(phoneNumber, role, text) {
+  const sess = await getSession(phoneNumber);
+  sess.messages.push({ role, text, at: new Date().toISOString() });
+  if (sess.messages.length > MAX_IN_MEMORY) {
+    sess.messages.splice(0, sess.messages.length - MAX_IN_MEMORY);
+  }
+
+  if (dbAvailable) {
+    await dbSave(phoneNumber, sess.messages, sess.preferences);
+  } else {
+    const mem = getMemory(phoneNumber);
+    mem.messages = sess.messages;
+  }
+  return sess;
 }
 
-function getLastShownArtisans(phoneNumber) {
-  return getPreferences(phoneNumber).lastShownArtisans || [];
+async function getRecentMessages(phoneNumber, count = 6) {
+  const sess = await getSession(phoneNumber);
+  return sess.messages.slice(-count);
+}
+
+async function setPreferences(phoneNumber, partialPrefs) {
+  const sess = await getSession(phoneNumber);
+  const merged = { ...sess.preferences, ...partialPrefs };
+
+  if (dbAvailable) {
+    await dbSave(phoneNumber, sess.messages, merged);
+  } else {
+    const mem = getMemory(phoneNumber);
+    mem.preferences = merged;
+  }
+  return merged;
+}
+
+async function getPreferences(phoneNumber) {
+  const sess = await getSession(phoneNumber);
+  return sess.preferences ?? {};
+}
+
+async function clearSession(phoneNumber) {
+  memoryStore.delete(phoneNumber);
+  await dbDelete(phoneNumber);
+}
+
+async function setLastShownProviders(phoneNumber, providers) {
+  await setPreferences(phoneNumber, { lastShownProviders: providers.slice(0, 5) });
+}
+
+async function getLastShownProviders(phoneNumber) {
+  const prefs = await getPreferences(phoneNumber);
+  return prefs.lastShownProviders ?? [];
+}
+
+// Legacy alias for old artisan code still in use
+async function setLastShownArtisans(phoneNumber, artisans) {
+  return setLastShownProviders(phoneNumber, artisans);
+}
+async function getLastShownArtisans(phoneNumber) {
+  return getLastShownProviders(phoneNumber);
 }
 
 module.exports = {
@@ -77,6 +162,9 @@ module.exports = {
   setPreferences,
   getPreferences,
   clearSession,
+  setLastShownProviders,
+  getLastShownProviders,
+  // Legacy
   setLastShownArtisans,
   getLastShownArtisans,
 };

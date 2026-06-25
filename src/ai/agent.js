@@ -1,213 +1,261 @@
-const gemini = require('./gemini');
+/**
+ * AI Agent — role-aware conversational assistant.
+ *
+ * Flow:
+ * 1. Role is determined from session (resolved by roleResolver.js at message handler)
+ * 2. Intent is extracted via Gemini (JSON, structured)
+ * 3. If intent maps to a backend action, the action is executed
+ * 4. Gemini generates a natural-language reply with the result
+ */
+
+const gemini  = require('./gemini');
 const { buildExtractionPrompt, buildResponsePrompt } = require('./prompt');
-const artisanService = require('../artisans/artisanService');
-const session = require('../whatsapp/session');
-const logger = require('../config/logger');
+const backend  = require('../api/backendClient');
+const session  = require('../whatsapp/session');
+const logger   = require('../config/logger');
 
-const FALLBACK_NO_AI_REPLY =
-  "Sorry, I'm having trouble understanding right now 🙏. Could you tell me again — what service do you need, and what area are you in?";
+const FALLBACK = "Sorry, I'm having trouble right now 🙏. Please try again in a moment.";
 
-function normalizeIntent(raw, previousPrefs = {}) {
-  const safe = raw || {};
+// ─── Intent normalization ─────────────────────────────────────────────────────
+
+function normalizeIntent(raw, prev = {}) {
+  const s = raw || {};
   return {
-    service:                safe.service                || previousPrefs.lastService  || null,
-    location:               safe.location               || previousPrefs.lastLocation || null,
-    urgency:                ['low', 'normal', 'high'].includes(safe.urgency) ? safe.urgency : 'normal',
-    budget:                 typeof safe.budget === 'number' ? safe.budget : previousPrefs.lastBudget || null,
-    requirements:           safe.requirements           || null,
-    intent:                 safe.intent                 || 'other',
-    missing_info:           Array.isArray(safe.missing_info) ? safe.missing_info : [],
-    selected_artisan_index: typeof safe.selected_artisan_index === 'number' ? safe.selected_artisan_index : null,
-    user_name:              safe.user_name              || null,
+    service:                s.service   || prev.lastService  || null,
+    location:               s.location  || prev.lastLocation || null,
+    urgency:                ['low','normal','high'].includes(s.urgency) ? s.urgency : 'normal',
+    budget:                 typeof s.budget === 'number' ? s.budget : prev.lastBudget || null,
+    intent:                 s.intent || 'other',
+    missing_info:           Array.isArray(s.missing_info) ? s.missing_info : [],
+    selected_index:         typeof s.selected_index === 'number' ? s.selected_index : null,
+    user_name:              s.user_name || null,
+    action:                 s.action    || null,  // backend action to execute
+    action_params:          s.action_params || {}, // params for the action
   };
 }
 
-// ---------------------------------------------------------------------------
-// Connect reply — no AI call, deterministic
-// ---------------------------------------------------------------------------
+// ─── Backend action executor ──────────────────────────────────────────────────
 
-function buildConnectReply(artisan, userName) {
-  const greeting  = userName ? `${userName}, g` : 'G';
-  const avail     = artisan.available ? '✅ Available now' : '🕒 Currently unavailable';
-  const phone     = artisan.phone || 'not listed';
-  return (
-    `${greeting}reat — here are *${artisan.name}*'s details:\n\n` +
-    `📞 *${phone}*\n` +
-    `📍 ${artisan.location}\n` +
-    `⭐ ${artisan.rating} rating | ${artisan.completed_jobs} jobs completed\n` +
-    `${avail}\n\n` +
-    `You can reach them directly by call or WhatsApp. 🙏\n` +
-    `Let me know if you'd like to see other options or need anything else!`
-  );
+async function executeAction(intent, user) {
+  const { action, action_params, selected_index } = intent;
+  if (!action || !user) return null;
+
+  try {
+    switch (action) {
+
+      // Customer actions
+      case 'search_providers': {
+        const providers = await backend.searchProviders(intent.service, intent.location);
+        return { type: 'providers', data: providers };
+      }
+
+      case 'get_my_requests': {
+        const data = await backend.getCustomerRequests(user.profileId);
+        return { type: 'requests', data };
+      }
+
+      case 'get_my_bookings': {
+        const data = await backend.getCustomerBookings(user.profileId, action_params.status);
+        return { type: 'bookings', data };
+      }
+
+      case 'get_booking_detail': {
+        const id = action_params.bookingId;
+        if (!id) return null;
+        const data = await backend.getBooking(id);
+        return { type: 'booking', data };
+      }
+
+      case 'get_quotes': {
+        const id = action_params.requestId;
+        if (!id) return null;
+        const data = await backend.getQuotes(id);
+        return { type: 'quotes', data };
+      }
+
+      case 'cancel_booking': {
+        const id = action_params.bookingId;
+        if (!id) return null;
+        await backend.cancelBooking(id, { requesterId: user.profileId, requesterRole: 'CUSTOMER' });
+        return { type: 'cancelled', data: { bookingId: id } };
+      }
+
+      // Provider actions
+      case 'get_my_jobs': {
+        const data = await backend.getProviderJobs(user.profileId, action_params.status);
+        return { type: 'jobs', data };
+      }
+
+      case 'complete_job': {
+        const id = action_params.bookingId;
+        if (!id) return null;
+        await backend.completeJob(user.profileId, id);
+        return { type: 'completed', data: { bookingId: id } };
+      }
+
+      case 'start_job': {
+        const id = action_params.bookingId;
+        if (!id) return null;
+        await backend.startJob(user.profileId, id);
+        return { type: 'started', data: { bookingId: id } };
+      }
+
+      default:
+        return null;
+    }
+  } catch (err) {
+    logger.error('[agent] Action failed:', action, err.message);
+    return { type: 'error', message: err.message };
+  }
 }
 
-// ---------------------------------------------------------------------------
-// Deterministic greeting — no AI call needed
-// ---------------------------------------------------------------------------
+// ─── Main entry point ─────────────────────────────────────────────────────────
 
-function buildGreetingReply(userName) {
-  const name = userName ? `, ${userName}` : '';
-  return (
-    `Hi${name}! 🙏 Welcome to *Haven* — your church community's helping hand.\n\n` +
-    `We connect members to trusted, skilled people within the community. Whether you need:\n\n` +
-    `🔌 Electricians  🔧 Plumbers\n` +
-    `🚗 Mechanics  🧹 Cleaners\n` +
-    `❄️ Technicians  🪵 Carpenters  🎨 Painters\n\n` +
-    `…or someone to lend a hand with something else entirely — we're here.\n\n` +
-    `Just tell me *what you need* and *your area*, and I'll find the right person in your community!\n\n` +
-    `_Type /help anytime to see all options._`
-  );
-}
+async function handleUserMessage(phoneNumber, userMessage, user) {
+  await session.appendMessage(phoneNumber, 'user', userMessage);
 
-// ---------------------------------------------------------------------------
-// Main entry point
-// ---------------------------------------------------------------------------
+  const history  = await session.getRecentMessages(phoneNumber, 6);
+  const prevPrefs = await session.getPreferences(phoneNumber);
+  const lastShown = await session.getLastShownProviders(phoneNumber);
 
-/**
- * Process one inbound WhatsApp message and return the reply text.
- *
- * @param {string} phoneNumber
- * @param {string} userMessage
- */
-async function handleUserMessage(phoneNumber, userMessage) {
-  session.appendMessage(phoneNumber, 'user', userMessage);
+  // ── Greeting shortcut ──────────────────────────────────────────────────────
+  const norm = userMessage.trim().toLowerCase();
+  if (['hi','hello','hey','good morning','good afternoon','good evening'].includes(norm)) {
+    const reply = buildWelcome(user);
+    await session.appendMessage(phoneNumber, 'assistant', reply);
+    return reply;
+  }
 
-  const history   = session.getRecentMessages(phoneNumber, 6);
-  const prevPrefs = session.getPreferences(phoneNumber);
-
-  // ------------------------------------------------------------------
-  // Step 1: extract structured intent via Gemini (low temperature)
-  // ------------------------------------------------------------------
+  // ── Step 1: Extract intent ─────────────────────────────────────────────────
   let intent;
   try {
-    const extractionPrompt = buildExtractionPrompt(
-      userMessage,
-      history.slice(0, -1), // everything except the message we just appended
-      prevPrefs
-    );
-    const rawIntent = await gemini.generateJSON(extractionPrompt, { temperature: 0.1 });
+    const extractPrompt = buildExtractionPrompt(userMessage, history.slice(0,-1), prevPrefs, lastShown, user?.role);
+    const rawIntent = await gemini.generateJSON(extractPrompt, { temperature: 0.1 });
     intent = normalizeIntent(rawIntent, prevPrefs);
   } catch (err) {
     logger.error('[agent] Intent extraction failed:', err.message);
-    session.appendMessage(phoneNumber, 'assistant', FALLBACK_NO_AI_REPLY);
-    return FALLBACK_NO_AI_REPLY;
+    await session.appendMessage(phoneNumber, 'assistant', FALLBACK);
+    return FALLBACK;
   }
 
-  // Persist useful signal for future turns
+  // Persist preferences
   const updatedPrefs = {
     lastService:  intent.service  || prevPrefs.lastService,
     lastLocation: intent.location || prevPrefs.lastLocation,
     lastBudget:   intent.budget   || prevPrefs.lastBudget,
   };
-  // Capture user name once
-  if (intent.user_name && !prevPrefs.userName) {
-    updatedPrefs.userName = intent.user_name;
-  }
-  session.setPreferences(phoneNumber, updatedPrefs);
+  if (intent.user_name && !prevPrefs.userName) updatedPrefs.userName = intent.user_name;
+  await session.setPreferences(phoneNumber, updatedPrefs);
 
-  const userName = updatedPrefs.userName || prevPrefs.userName || null;
+  const userName = updatedPrefs.userName || prevPrefs.userName || user?.name || null;
 
-  // ------------------------------------------------------------------
-  // Step 2a: Greetings — no search, no second AI call
-  // ------------------------------------------------------------------
-  if (intent.intent === 'greeting' && !intent.service && !intent.location) {
-    const reply = buildGreetingReply(userName);
-    session.appendMessage(phoneNumber, 'assistant', reply);
+  // ── Step 2: Connect request (resolve from last shown) ─────────────────────
+  if ((intent.intent === 'connect_request' || intent.selected_index != null) && lastShown.length) {
+    const idx    = (intent.selected_index ?? 1) - 1;
+    const chosen = lastShown[Math.max(0, Math.min(lastShown.length - 1, idx))];
+    const reply  = buildConnectReply(chosen, userName);
+    await session.appendMessage(phoneNumber, 'assistant', reply);
     return reply;
   }
 
-  // ------------------------------------------------------------------
-  // Step 2b: connect_request — resolve from last shown artisans, no search
-  // ------------------------------------------------------------------
-  if (intent.intent === 'connect_request' || intent.selected_artisan_index != null) {
-    const lastShown = session.getLastShownArtisans(phoneNumber);
-
-    if (lastShown.length > 0) {
-      // selected_artisan_index is 1-based; default to first if unclear
-      const idx     = (intent.selected_artisan_index ?? 1) - 1;
-      const clamped = Math.max(0, Math.min(lastShown.length - 1, idx));
-      const chosen  = lastShown[clamped];
-
-      const reply = buildConnectReply(chosen, userName);
-      session.appendMessage(phoneNumber, 'assistant', reply);
-      return reply;
-    }
-
-    // User said "connect me" but we haven't shown results yet — ask what they need
-    if (!intent.service) {
-      const reply = "Sure, I can help you connect! What service do you need, and which area are you in?";
-      session.appendMessage(phoneNumber, 'assistant', reply);
-      return reply;
-    }
-    // Fall through to search if we have a service
+  // ── Step 3: Execute backend action if intent has one ──────────────────────
+  let actionResult = null;
+  if (intent.action) {
+    actionResult = await executeAction(intent, user);
   }
 
-  // ------------------------------------------------------------------
-  // Step 3: search artisans (only when we have enough info)
-  // ------------------------------------------------------------------
-  let artisans = [];
-
-  if (intent.service) {
+  // ── Step 4: Search providers if service intent and no action result ────────
+  let providers = [];
+  if (!actionResult && intent.service) {
     try {
-      artisans = await artisanService.searchArtisans({
-        service:  intent.service,
-        location: intent.location,
-        urgency:  intent.urgency,
-        budget:   intent.budget,
-      });
-      // Remember what we showed so connect_request can reference it
-      session.setLastShownArtisans(phoneNumber, artisans);
+      providers = await backend.searchProviders(intent.service, intent.location);
+      await session.setLastShownProviders(phoneNumber, providers);
     } catch (err) {
-      logger.error('[agent] Artisan search failed:', err.message);
-      artisans = [];
+      logger.error('[agent] Provider search failed:', err.message);
     }
   }
 
-  // ------------------------------------------------------------------
-  // Step 4: generate natural-language reply via Gemini
-  // ------------------------------------------------------------------
+  // ── Step 5: Generate reply ─────────────────────────────────────────────────
   try {
     const responsePrompt = buildResponsePrompt({
-      userMessage,
-      intent,
-      artisans,
-      usingDatabase: artisanService.isUsingDatabase(),
-      userName,
+      userMessage, intent, providers, actionResult, userName, role: user?.role,
     });
     const reply = await gemini.generateText(responsePrompt, { temperature: 0.5 });
-    session.appendMessage(phoneNumber, 'assistant', reply);
+    await session.appendMessage(phoneNumber, 'assistant', reply);
     return reply;
   } catch (err) {
     logger.error('[agent] Response generation failed:', err.message);
-    const fallback = buildDeterministicFallback(intent, artisans, userName);
-    session.appendMessage(phoneNumber, 'assistant', fallback);
+    const fallback = buildDeterministicFallback(intent, providers, actionResult, userName, user?.role);
+    await session.appendMessage(phoneNumber, 'assistant', fallback);
     return fallback;
   }
 }
 
-// ---------------------------------------------------------------------------
-// Deterministic fallback — when Gemini is down, still give a useful response
-// ---------------------------------------------------------------------------
+// ─── Deterministic fallbacks (no AI) ─────────────────────────────────────────
 
-function buildDeterministicFallback(intent, artisans, userName) {
+function buildWelcome(user) {
+  if (!user) {
+    return (
+      `👋 Hi! Welcome to *Haven*.\n\n` +
+      `Haven connects you to trusted service providers in your community.\n\n` +
+      `📱 It looks like your number isn't registered yet.\n` +
+      `Visit the Haven app to create an account, then come back here!\n\n` +
+      `_Type /help for more options._`
+    );
+  }
+  const name = user.name ?? '';
+  if (user.role === 'PROVIDER') {
+    return (
+      `👋 Hi *${name}*! You're logged in as a provider.\n\n` +
+      `Type *menu* to see your provider dashboard, or *jobs* to view your bookings.`
+    );
+  }
+  return (
+    `👋 Hi *${name}*! Welcome to Haven.\n\n` +
+    `Just tell me what service you need and your area — I'll find the right person! 🙏\n\n` +
+    `Or type *menu* for options.`
+  );
+}
+
+function buildConnectReply(provider, userName) {
+  const hi = userName ? `${userName}, ` : '';
+  return (
+    `${hi}here are *${provider.businessName ?? provider.name}*'s contact details:\n\n` +
+    `📞 *${provider.phone}*\n` +
+    `📍 ${provider.location}\n` +
+    `⭐ ${provider.avgRating ?? provider.rating} rating | ${provider.totalReviews ?? provider.completed_jobs} jobs\n\n` +
+    `Reach them directly by call or WhatsApp. 🙏\n` +
+    `Let me know if you'd like to see other options!`
+  );
+}
+
+function buildDeterministicFallback(intent, providers, actionResult, userName, role) {
   const hi = userName ? `${userName}, ` : '';
 
-  if (!intent.service) {
-    return `${hi}What service do you need help with (e.g. electrician, plumber, mechanic, cleaner), and what area are you in?`;
+  if (actionResult?.type === 'error') {
+    return `Sorry ${hi}I ran into an issue: _${actionResult.message}_\n\nPlease try again or visit the Haven app. 🙏`;
   }
-  if (!intent.location) {
-    return `${hi}Got it, you need a *${intent.service}*. What area are you in so I can find someone nearby?`;
+  if (actionResult?.type === 'cancelled') {
+    return `✅ Your booking has been cancelled, ${hi}. Let me know if you need help finding another provider!`;
   }
-  if (!artisans.length) {
-    return `Sorry${hi ? ` ${userName}` : ''}, I couldn't find any *${intent.service}s* near ${intent.location} right now. Want me to check a nearby area?`;
+  if (actionResult?.type === 'completed') {
+    return `🎉 Job marked complete! Well done ${hi}. The customer has been notified.`;
   }
 
-  const lines = artisans.slice(0, 3).map((a, i) => {
-    const avail = a.available ? '⚡ Available now' : '🕒 Unavailable';
-    return `${i + 1}. *${a.name}*\n⭐ ${a.rating} | 📍 ${a.location}\n${avail} | Est. ${a.average_response_time} mins`;
-  });
+  if (!intent.service && role !== 'PROVIDER') {
+    return `${hi}What service do you need help with (e.g. electrician, plumber, cleaner), and which area are you in?`;
+  }
+  if (!providers.length && intent.service) {
+    return `Sorry ${hi}I couldn't find any *${intent.service}s* near ${intent.location || 'your area'} right now. Would you like me to check nearby?`;
+  }
+  if (providers.length) {
+    const lines = providers.slice(0, 3).map((p, i) =>
+      `${i + 1}. *${p.businessName}* | ⭐${Number(p.avgRating).toFixed(1)} | 📍${p.location}`
+    );
+    return `Here are the top *${intent.service}s* near ${intent.location}:\n\n${lines.join('\n')}\n\nWould you like to connect with one?`;
+  }
 
-  return `Here are the best *${intent.service}s* near ${intent.location}:\n\n${lines.join('\n\n')}\n\nWould you like me to connect you to one of them?`;
+  return `${hi}How can I help you today? Type *menu* to see what I can do. 🙏`;
 }
 
 module.exports = { handleUserMessage };
