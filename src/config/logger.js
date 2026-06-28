@@ -1,6 +1,5 @@
 /**
- * Minimal leveled logger so we don't need extra dependencies like pino-pretty.
- * Swap this out for pino/winston in production if you want structured logs.
+ * Leveled logger — reads logLevel from config (which reads LOG_LEVEL from .env).
  */
 const config = require('./index');
 
@@ -14,7 +13,7 @@ function timestamp() {
 function build(level) {
   return (...args) => {
     if (LEVELS[level] < currentLevel) return;
-    const prefix = `[${timestamp()}] [${level.toUpperCase()}]`;
+    const prefix = `[${timestamp()}] [${level.toUpperCase().padEnd(5)}]`;
     if (level === 'error') console.error(prefix, ...args);
     else if (level === 'warn') console.warn(prefix, ...args);
     else console.log(prefix, ...args);
@@ -24,7 +23,7 @@ function build(level) {
 module.exports = {
   trace: build('trace'),
   debug: build('debug'),
-  info: build('info'),
-  warn: build('warn'),
+  info:  build('info'),
+  warn:  build('warn'),
   error: build('error'),
 };

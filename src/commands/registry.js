@@ -6,6 +6,7 @@
 const backend  = require('../api/backendClient');
 const session  = require('../whatsapp/session');
 const logger   = require('../config/logger');
+const { getStoredPassword, attemptBackendRegistration } = require('../whatsapp/registration');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -306,7 +307,7 @@ const UNIVERSAL_TRIGGERS = {
 /**
  * Try to dispatch a command. Returns true if handled, false if not a command.
  */
-async function dispatch(sock, jid, phoneNumber, text, user) {
+async function dispatch(sock, jid, sessionKey, text, user) {
   const norm = text.trim().toLowerCase();
   const role = user?.role ?? null;
 
@@ -314,7 +315,7 @@ async function dispatch(sock, jid, phoneNumber, text, user) {
   if (UNIVERSAL_TRIGGERS[norm]) {
     const action = UNIVERSAL_TRIGGERS[norm];
     if (action === '_reset') {
-      await session.clearSession(phoneNumber);
+      await session.clearSession(sessionKey);
       await safeSend(sock, jid, `Conversation reset ✅\n\nFresh start! How can I help you? 🙏`);
       return true;
     }
@@ -329,6 +330,54 @@ async function dispatch(sock, jid, phoneNumber, text, user) {
       );
       return true;
     }
+  }
+
+  // ── Password recall (for users registered via bot) ─────────────────────────
+  if (['my password', 'password', 'what is my password', "what's my password"].includes(norm)) {
+    const pwd = await getStoredPassword(sessionKey);
+    if (pwd) {
+      const prefs = await session.getPreferences(sessionKey);
+      await safeSend(sock, jid,
+        `🔑 Your Haven password is: \`${pwd}\`\n\n` +
+        `📱 Phone: +${prefs.confirmedPhone ?? '—'}\n\n` +
+        `Log in at https://haven-rccg.vercel.app\n` +
+        `_Keep this safe — don't share it with anyone._`
+      );
+    } else {
+      await safeSend(sock, jid,
+        `I don't have a stored password for your account.\n` +
+        `If you registered on the Haven website, use the password you chose there.\n\n` +
+        `Need help? Visit https://haven-rccg.vercel.app`
+      );
+    }
+    return true;
+  }
+
+  // ── Manual retry for pending backend registration ─────────────────────────
+  if (['/retry', 'retry', 'retry registration'].includes(norm)) {
+    const prefs = await session.getPreferences(sessionKey);
+    if (prefs.regPendingBackend && prefs.userName && prefs.regPassword && prefs.confirmedPhone) {
+      await safeSend(sock, jid, `⏳ Retrying account sync…`);
+      // Force retry by resetting the cooldown timer
+      await session.setPreferences(sessionKey, { regLastAttempt: 0 });
+      const freshPrefs = await session.getPreferences(sessionKey);
+      const result = await attemptBackendRegistration(
+        sessionKey, prefs.confirmedPhone, prefs.userName, prefs.regEmail, prefs.regPassword, freshPrefs
+      );
+      if (result) {
+        await safeSend(sock, jid,
+          `✅ Account fully synced! You're all set on Haven, *${prefs.userName}*. 🙏`
+        );
+      } else {
+        await safeSend(sock, jid,
+          `⚠️ Still couldn't reach the Haven server.\n` +
+          `Don't worry — you can still use the bot normally. I'll keep retrying in the background. 🙏`
+        );
+      }
+    } else {
+      await safeSend(sock, jid, `No pending registration to retry. You're all set! 🙏`);
+    }
+    return true;
   }
 
   // ── Job status shortcuts for providers ────────────────────────────────────

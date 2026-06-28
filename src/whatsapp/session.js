@@ -1,15 +1,18 @@
 /**
- * Session store — PostgreSQL-backed via the BotSession Prisma model.
- * Falls back to in-memory if DB is unavailable (e.g. dev without DB).
+ * Session store — PostgreSQL-backed with in-memory fallback.
  *
- * The interface is async throughout so the caller never needs to know
- * whether it's hitting the DB or an in-memory Map.
+ * Changes from the previous version:
+ *  - MAX_MESSAGES raised to 50 (supports richer AI context window)
+ *  - appendMessage now returns the session snapshot
+ *  - getRecentMessages supports arbitrary count (default 20 for AI)
+ *  - All public methods are unchanged so callers need no updates
  */
 
 const logger = require('../config/logger');
 
-// ─── In-memory fallback ───────────────────────────────────────────────────────
-const MAX_IN_MEMORY = 20;
+// Messages kept in memory / per-session (raised from 20 to 50)
+const MAX_MESSAGES = 50;
+
 const memoryStore = new Map();
 
 function getMemory(phoneNumber) {
@@ -19,8 +22,8 @@ function getMemory(phoneNumber) {
   return memoryStore.get(phoneNumber);
 }
 
-// ─── DB layer (lazy-loaded to avoid circular imports) ─────────────────────────
-let db = null;
+// DB layer (lazy-loaded to avoid circular imports)
+let db          = null;
 let dbAvailable = false;
 
 async function getDb() {
@@ -32,13 +35,11 @@ async function getDb() {
     logger.info('[session] Using PostgreSQL-backed sessions');
   } catch (err) {
     logger.warn('[session] DB unavailable — using in-memory sessions:', err.message);
-    db = null;
+    db          = null;
     dbAvailable = false;
   }
   return db;
 }
-
-// ─── Internal DB helpers ──────────────────────────────────────────────────────
 
 async function dbGet(phoneNumber) {
   const d = await getDb();
@@ -48,7 +49,7 @@ async function dbGet(phoneNumber) {
       'SELECT messages, preferences FROM bot_sessions WHERE phone_number = $1',
       [phoneNumber]
     );
-    return rows[0] ?? null;
+    return rows[0] || null;
   } catch (err) {
     logger.warn('[session] dbGet failed:', err.message);
     return null;
@@ -81,7 +82,7 @@ async function dbDelete(phoneNumber) {
   }
 }
 
-// ─── Public interface ─────────────────────────────────────────────────────────
+// ── Public interface ───────────────────────────────────────────────────────────
 
 async function getSession(phoneNumber) {
   const row = await dbGet(phoneNumber);
@@ -97,8 +98,10 @@ async function getSession(phoneNumber) {
 async function appendMessage(phoneNumber, role, text) {
   const sess = await getSession(phoneNumber);
   sess.messages.push({ role, text, at: new Date().toISOString() });
-  if (sess.messages.length > MAX_IN_MEMORY) {
-    sess.messages.splice(0, sess.messages.length - MAX_IN_MEMORY);
+
+  // Trim to MAX_MESSAGES, keeping the most recent
+  if (sess.messages.length > MAX_MESSAGES) {
+    sess.messages.splice(0, sess.messages.length - MAX_MESSAGES);
   }
 
   if (dbAvailable) {
@@ -110,7 +113,7 @@ async function appendMessage(phoneNumber, role, text) {
   return sess;
 }
 
-async function getRecentMessages(phoneNumber, count = 6) {
+async function getRecentMessages(phoneNumber, count = 20) {
   const sess = await getSession(phoneNumber);
   return sess.messages.slice(-count);
 }
@@ -130,7 +133,7 @@ async function setPreferences(phoneNumber, partialPrefs) {
 
 async function getPreferences(phoneNumber) {
   const sess = await getSession(phoneNumber);
-  return sess.preferences ?? {};
+  return sess.preferences || {};
 }
 
 async function clearSession(phoneNumber) {
@@ -144,10 +147,10 @@ async function setLastShownProviders(phoneNumber, providers) {
 
 async function getLastShownProviders(phoneNumber) {
   const prefs = await getPreferences(phoneNumber);
-  return prefs.lastShownProviders ?? [];
+  return prefs.lastShownProviders || [];
 }
 
-// Legacy alias for old artisan code still in use
+// Legacy aliases
 async function setLastShownArtisans(phoneNumber, artisans) {
   return setLastShownProviders(phoneNumber, artisans);
 }
@@ -164,7 +167,6 @@ module.exports = {
   clearSession,
   setLastShownProviders,
   getLastShownProviders,
-  // Legacy
   setLastShownArtisans,
   getLastShownArtisans,
 };

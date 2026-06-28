@@ -2,62 +2,61 @@
  * Message handler — entry point for every incoming WhatsApp message.
  *
  * Pipeline:
- * 1. Deduplicate (ignore already-processed message IDs)
- * 2. Rate limit (per phone number)
- * 3. Resolve user role (from session cache → backend API)
- * 4. Try command dispatch (zero AI cost)
- * 5. Fall through to AI agent
+ *   1. Deduplicate
+ *   2. Rate limit
+ *   3. Registration state machine (non-blocking)
+ *   4. Command dispatch
+ *   5. AI agent
+ *
+ * KEY CHANGE: handleRegistration now always returns { handled, user, regContext }.
+ * Even when handled=false the regContext is passed to the AI agent so Ava can
+ * answer questions naturally AND gently nudge registration forward in the same reply.
  */
 
-const { handleUserMessage } = require('../ai/agent');
-const { dispatch }          = require('../commands/registry');
-const { resolveUser }       = require('../api/roleResolver');
-const session               = require('./session');
-const logger                = require('../config/logger');
+const { handleUserMessage }  = require('../ai/agent');
+const { dispatch }           = require('../commands/registry');
+const { resolveUser }        = require('../api/roleResolver');
+const { handleRegistration } = require('./registration');
+const logger                 = require('../config/logger');
 
-// ─── Deduplication ───────────────────────────────────────────────────────────
-// Keep the last 500 processed message IDs in a bounded Set to prevent
-// duplicate processing when WhatsApp re-delivers messages.
+// ── Deduplication ─────────────────────────────────────────────────────────────
 const MAX_SEEN = 500;
 const seenMessageIds = new Set();
 
 function markSeen(id) {
   if (seenMessageIds.size >= MAX_SEEN) {
-    // Remove the oldest entry
     seenMessageIds.delete(seenMessageIds.values().next().value);
   }
   seenMessageIds.add(id);
 }
 
-// ─── Per-phone rate limiting ──────────────────────────────────────────────────
-const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
-const RATE_LIMIT_MAX       = 15;     // messages per window
+// ── Rate limiting ─────────────────────────────────────────────────────────────
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX       = 15;
+const rateLimitWindows     = new Map();
 
-const rateLimitWindows = new Map(); // phone → { count, windowStart }
-
-function isRateLimited(phone) {
+function isRateLimited(sessionKey) {
   const now = Date.now();
-  const w   = rateLimitWindows.get(phone);
+  const w   = rateLimitWindows.get(sessionKey);
   if (!w || now - w.windowStart > RATE_LIMIT_WINDOW_MS) {
-    rateLimitWindows.set(phone, { count: 1, windowStart: now });
+    rateLimitWindows.set(sessionKey, { count: 1, windowStart: now });
     return false;
   }
   w.count++;
-  if (w.count > RATE_LIMIT_MAX) return true;
-  return false;
+  return w.count > RATE_LIMIT_MAX;
 }
 
-// ─── Helper ───────────────────────────────────────────────────────────────────
-function extractPhone(jid) {
-  // JID format: 2348012345678@s.whatsapp.net
-  return jid.split('@')[0].replace(/[^0-9]/g, '');
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function logLabel(jid, user) {
+  if (user && user.phone) return user.phone;
+  if (jid.endsWith('@lid')) return `${jid} (linked-device id)`;
+  return jid;
 }
 
 async function safeSendText(sock, jid, text) {
   try {
-    // Typing indicator
     await sock.sendPresenceUpdate('composing', jid).catch(() => {});
-    // Small realistic delay
     await new Promise(r => setTimeout(r, Math.min(text.length * 12, 2500)));
     await sock.sendPresenceUpdate('paused', jid).catch(() => {});
     await sock.sendMessage(jid, { text });
@@ -66,71 +65,88 @@ async function safeSendText(sock, jid, text) {
   }
 }
 
-// ─── Main handler ─────────────────────────────────────────────────────────────
+// ── Main handler ──────────────────────────────────────────────────────────────
 
 async function handleMessage(sock, msg) {
+  let jid;
   try {
-    // 1. Basic extraction
-    const jid         = msg.key.remoteJid;
-    const messageId   = msg.key.id;
-    const fromMe      = msg.key.fromMe;
+    jid              = msg.key.remoteJid;
+    const messageId  = msg.key.id;
+    const fromMe     = msg.key.fromMe;
 
-    // Ignore outbound messages and status updates
     if (fromMe || jid === 'status@broadcast') return;
 
-    const content = msg.message?.conversation
-      ?? msg.message?.extendedTextMessage?.text
-      ?? msg.message?.imageMessage?.caption
-      ?? null;
+    const content =
+      msg.message?.conversation ??
+      msg.message?.extendedTextMessage?.text ??
+      msg.message?.imageMessage?.caption ??
+      null;
 
     if (!content || !content.trim()) return;
 
-    // 2. Deduplicate
+    // Deduplicate
     if (seenMessageIds.has(messageId)) {
-      logger.debug('[messageHandler] Duplicate message ignored:', messageId);
+      logger.debug('[messageHandler] Duplicate ignored:', messageId);
       return;
     }
     markSeen(messageId);
 
-    const phoneNumber = extractPhone(jid);
-    const text        = content.trim();
+    const sessionKey = jid;
+    const text       = content.trim();
 
-    logger.info(`[messageHandler] Message from ${phoneNumber}: "${text.slice(0, 80)}"`);
+    logger.info(`[messageHandler] Message from ${jid}: "${text.slice(0, 80)}"`);
 
-    // 3. Rate limit
-    if (isRateLimited(phoneNumber)) {
-      logger.warn(`[messageHandler] Rate limit hit for ${phoneNumber}`);
+    // Rate limit
+    if (isRateLimited(sessionKey)) {
+      logger.warn(`[messageHandler] Rate limit hit for ${jid}`);
       await safeSendText(sock, jid,
-        `⚠️ You're sending messages too fast.\nPlease wait a moment before trying again. 🙏`
+        `⚠️ You're sending messages too fast. Please wait a moment. 🙏`
       );
       return;
     }
 
-    // 4. Mark as read
     await sock.readMessages([msg.key]).catch(() => {});
 
-    // 5. Resolve user role
-    const user = await resolveUser(phoneNumber);
+    // ── Registration state machine ────────────────────────────────────────────
+    // Never blocks. Returns { handled, user, regContext } always.
+    const reg = await handleRegistration(sock, jid, sessionKey, text);
 
-    // 6. Try command dispatch (no AI cost for known commands)
-    const handled = await dispatch(sock, jid, phoneNumber, text, user);
+    if (reg.handled) {
+      // Message was consumed by the registration flow (e.g. "is this your number?")
+      return;
+    }
+
+    // reg.user may be null (not yet identified) or a provisional/full user object
+    let user = reg.user;
+    const regContext = reg.regContext;
+
+    // If user is null, try the role resolver (checks session cache)
+    if (!user) {
+      user = await resolveUser(sessionKey);
+    }
+
+    logger.info(`[messageHandler] User for ${logLabel(jid, user)}: role=${user && user.role || 'unregistered'}`);
+
+    // ── Command dispatch ──────────────────────────────────────────────────────
+    const handled = await dispatch(sock, jid, sessionKey, text, user);
     if (handled) return;
 
-    // 7. AI agent
-    const reply = await handleUserMessage(phoneNumber, text, user);
+    // ── AI agent ──────────────────────────────────────────────────────────────
+    // Pass regContext so the AI knows the registration state and can weave
+    // it naturally into conversation without trapping the user.
+    const reply = await handleUserMessage(sessionKey, text, user, regContext);
     await safeSendText(sock, jid, reply);
 
   } catch (err) {
     logger.error('[messageHandler] Unhandled error:', err.message, err.stack);
     try {
-      const jid = msg?.key?.remoteJid;
       if (jid) {
         await sock.sendMessage(jid, {
           text: `Something went wrong on my end 🙏. Please try again in a moment.`,
         });
       }
     } catch {
-      // last resort — swallow
+      // last resort
     }
   }
 }

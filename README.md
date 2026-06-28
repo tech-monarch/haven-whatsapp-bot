@@ -1,257 +1,176 @@
-# WhatsApp Artisan Marketplace Bot 🛠️
+# Haven WhatsApp Bot
 
-An AI-powered WhatsApp chatbot that helps users find and connect with verified artisans
-(electricians, plumbers, mechanics, cleaners, technicians, carpenters, painters, etc).
-
-Built with:
-- **Node.js** + **Baileys** (`@whiskeysockets/baileys`) for WhatsApp connectivity
-- **Google Gemini API** for natural language understanding and response generation
-- **PostgreSQL** for artisan data, with an automatic **mock data fallback** so the bot
-  works fully even before the production backend is ready
+A WhatsApp bot for the Haven service marketplace — connecting customers to trusted service providers in Nigeria. Built with [Baileys](https://github.com/WhiskeySockets/Baileys), [Groq](https://groq.com), and PostgreSQL.
 
 ---
 
-## 1. How it works
-
-```
-WhatsApp message
-      │
-      ▼
-messageHandler.js  ──►  ai/agent.js
-                            │
-                            ├─► ai/gemini.js   (extract structured intent: service, location, urgency, budget)
-                            │
-                            ├─► artisans/artisanService.js
-                            │         ├─► database/queries.js (PostgreSQL)   [if DATABASE_URL set]
-                            │         └─► artisans/mockData.js (in-memory)   [fallback]
-                            │
-                            ├─► artisans/ranking.js  (scores + sorts results)
-                            │
-                            └─► ai/gemini.js   (turn ranked results into a natural reply)
-                                      │
-                                      ▼
-                              WhatsApp reply sent
-```
-
-Conversation memory is kept in-memory per phone number (`whatsapp/session.js`), so the
-bot remembers the last service/location/budget mentioned and can handle natural
-follow-ups like "make it Lekki instead."
-
----
-
-## 2. Project structure
+## What's inside
 
 ```
 src/
-├── whatsapp/
-│   ├── client.js          # Baileys connection, QR login, auto-reconnect, message intake
-│   ├── messageHandler.js  # Validates + routes incoming messages, sends replies
-│   └── session.js         # In-memory conversation memory (swappable for DB later)
-│
 ├── ai/
-│   ├── gemini.js          # Gemini API wrapper (text + JSON generation, error handling)
-│   ├── prompt.js          # System prompt + prompt builders for intent extraction & replies
-│   └── agent.js           # Orchestrates: extract intent → search → rank → reply
-│
+│   ├── agent.js          # AI conversation engine (context-aware, offline-resilient)
+│   ├── aiClient.js       # AI facade — generateText / generateJSON
+│   └── prompt.js         # System + user prompt builders (system/user split)
+├── api/
+│   ├── backendClient.js  # Haven backend HTTP client (classifies network vs HTTP errors)
+│   └── roleResolver.js   # Resolves user role from session cache or backend
 ├── artisans/
-│   ├── artisanService.js  # Unified search interface, auto DB/mock fallback + geocoding
-│   ├── ranking.js         # Weighted scoring algorithm (rating/distance/availability/etc)
-│   └── mockData.js        # 24 mock artisans across 7 categories for fallback mode
-│
-├── database/
-│   ├── postgres.js        # Connection pool, schema setup, connection testing
-│   └── queries.js         # Parameterized SQL queries (by service/location/rating/etc)
-│
+│   ├── artisanService.js # Local provider search (fallback when backend offline)
+│   ├── mockData.js       # Seed / mock provider data
+│   └── ranking.js        # Provider ranking logic
+├── commands/
+│   └── registry.js       # Zero-AI command dispatch (/menu, /jobs, etc.)
 ├── config/
-│   ├── index.js           # Centralized env config (loads .env)
-│   └── logger.js           # Lightweight leveled logger
-│
-└── index.js                # Boots everything + health-check HTTP server
+│   ├── index.js          # Centralised config (reads .env)
+│   ├── logger.js         # Pino logger
+│   └── validateEnv.js    # Fail-fast env validation on boot
+├── database/
+│   ├── postgres.js       # PG pool + schema bootstrap
+│   └── queries.js        # Artisan/provider SQL queries
+├── providers/
+│   ├── groqProvider.js   # Groq SDK wrapper (compound-beta-mini + web_search)
+│   └── providerManager.js# Key rotation, failover, cooldown
+├── sync/
+│   ├── localProfile.js   # Local user profile store (pre-sync)
+│   └── syncQueue.js      # Persistent background sync queue (exponential backoff)
+└── whatsapp/
+    ├── client.js         # Baileys socket, pairing, reconnect
+    ├── messageHandler.js # Message pipeline (dedup → rate-limit → onboard → AI)
+    ├── phoneUtils.js     # Phone normalisation / validation
+    ├── registration.js   # Onboarding state machine (offline-first)
+    └── session.js        # Session store (PostgreSQL + in-memory fallback)
+index.js                  # Entry point — HTTP server + WhatsApp + sync daemon
 ```
 
 ---
 
-## 3. Setup
-
-### Prerequisites
-- Node.js 18+
-- A WhatsApp account (a spare number is recommended for testing, since Baileys uses
-  WhatsApp's "Linked Devices" feature)
-- A Gemini API key from [Google AI Studio](https://aistudio.google.com/app/apikey)
-- (Optional) a PostgreSQL database
-
-### Install
+## Quick start
 
 ```bash
-npm install
 cp .env.example .env
-```
-
-Edit `.env`:
-
-```env
-GEMINI_API_KEY=your_key_here
-GEMINI_MODEL=gemini-1.5-flash
-DATABASE_URL=                 # leave empty to use mock data
-PORT=3000
-ADMIN_NUMBERS=
-LOG_LEVEL=info
-```
-
-### Run locally
-
-```bash
+# Fill in GROQ_API_KEY, DATABASE_URL, WA_PHONE_NUMBER, BACKEND_BASE_URL, INTERNAL_API_KEY
+npm install
 npm start
 ```
 
-On first run you'll see a QR code printed in the terminal:
-
-```
-[whatsapp] Scan this QR code with WhatsApp (Linked Devices):
-█████████████████████████
-██ ▄▄▄▄▄ █▀█ █▄█▄▄▄▄▄ ████
-...
-```
-
-Open WhatsApp on your phone → **Settings → Linked Devices → Link a Device** → scan the
-QR code. Once connected you'll see:
-
-```
-[whatsapp] Connected successfully ✅
-[index] WhatsApp client is ready to receive messages.
-```
-
-Your session is saved to `auth_sessions/` so you won't need to re-scan on every restart.
-If you ever get logged out, delete that folder and re-scan.
-
-### Try it
-
-Send the bot a WhatsApp message like:
-
-> "I need an electrician in Ikeja urgently"
-
-It should reply with ranked artisan recommendations, similar to:
-
-```
-Here are the best electricians near you:
-
-1. John Electrical Services
-⭐ 4.9 rating
-📍 Ikeja
-⚡ Available now
-Estimated response: 10 mins
-
-2. Bright Fix Solutions
-⭐ 4.7 rating
-📍 Allen
-Available today
-
-Would you like me to connect you?
-```
+On first boot you will see a pairing code — enter it in WhatsApp → Settings → Linked Devices → Link with phone number.
 
 ---
 
-## 4. Switching to PostgreSQL
+## Environment variables
 
-The bot **automatically** uses PostgreSQL once `DATABASE_URL` is set — no code changes
-needed.
-
-1. Set `DATABASE_URL` in `.env`, e.g.:
-   ```
-   DATABASE_URL=postgres://user:password@localhost:5432/artisan_marketplace
-   ```
-2. On boot, `database/postgres.js` will automatically run `ensureSchema()` to create the
-   `artisans` table if it doesn't exist yet:
-   ```sql
-   CREATE TABLE artisans (
-     id SERIAL PRIMARY KEY,
-     name VARCHAR(255) NOT NULL,
-     phone VARCHAR(50) NOT NULL,
-     category VARCHAR(100) NOT NULL,
-     description TEXT,
-     rating NUMERIC(2,1) DEFAULT 0,
-     completed_jobs INTEGER DEFAULT 0,
-     location VARCHAR(255) NOT NULL,
-     latitude DOUBLE PRECISION,
-     longitude DOUBLE PRECISION,
-     available BOOLEAN DEFAULT true,
-     average_response_time INTEGER,
-     price_range VARCHAR(100),
-     created_at TIMESTAMP DEFAULT NOW(),
-     updated_at TIMESTAMP DEFAULT NOW()
-   );
-   ```
-3. Seed it with real artisans (you can reuse the shape in `artisans/mockData.js`, or use
-   `queries.insertArtisan(...)`).
-4. If the connection ever fails at runtime, `artisanService.js` automatically logs a
-   warning and falls back to mock data for that request instead of crashing.
-
-Check current mode anytime via the health endpoint:
-
-```bash
-curl http://localhost:3000/health
-# { "status": "ok", "databaseMode": "mock" }   <-- or "postgres"
-```
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `GROQ_API_KEY` | ✅ | — | Groq API key |
+| `GROQ_API_KEY_1` … `_10` | — | — | Multiple keys for rotation |
+| `GROQ_MODEL` | — | `compound-beta-mini` | Any Groq model ID |
+| `DATABASE_URL` | — | — | PostgreSQL connection string. Without it sessions are in-memory only |
+| `WA_PHONE_NUMBER` | ✅ | — | Bot's WhatsApp number (digits only, e.g. `2348012345678`) |
+| `SESSION_PATH` | — | `./whatsapp-session` | Baileys session directory |
+| `BACKEND_BASE_URL` | ✅ | `http://localhost:3001` | Haven backend base URL |
+| `INTERNAL_API_KEY` | ✅ | — | Shared secret for backend ↔ bot calls |
+| `PORT` | — | `3000` | HTTP server port |
+| `LOG_LEVEL` | — | `info` | `debug` / `info` / `warn` / `error` |
+| `RENDER_EXTERNAL_URL` | — | — | Set on Render to enable self-ping keep-alive |
+| `ADMIN_NUMBERS` | — | — | Comma-separated admin WhatsApp numbers |
 
 ---
 
-## 5. Ranking algorithm
+## AI model — `compound-beta-mini`
 
-Each artisan candidate is scored 0–1 using weighted factors:
+The default model is `compound-beta-mini`. Key properties:
 
-| Factor              | Weight |
-|----------------------|--------|
-| Rating               | 40%    |
-| Distance             | 25%    |
-| Availability         | 20%    |
-| Completed jobs (experience) | 10% |
-| Price match          | 5%     |
+- **Built-in web search** — the provider automatically enables Groq's `web_search` tool so the AI can look up current prices, availability, and general questions without any extra setup.
+- **System / user role split** — the system prompt is sent in the dedicated `system` role, not prepended to the user message. This gives significantly better instruction-following.
+- **Fast** — compound-beta-mini is optimised for low-latency chat use cases.
 
-See `artisans/ranking.js` for the full implementation (Haversine distance, normalization,
-budget-tolerance scoring, etc). Results are always returned sorted best-first.
+To switch model, set `GROQ_MODEL` in `.env` (e.g. `GROQ_MODEL=llama-3.3-70b-versatile`). Web search is only auto-enabled for `compound-beta-mini` and `compound-beta`.
 
 ---
 
-## 6. Memory model
+## Key features
 
-```js
-// whatsapp/session.js (current: in-memory Map)
+### Offline-first authentication
+If the Haven backend is unreachable during login or registration:
+- The user's details are saved locally in `local_user_profiles`.
+- The failed request is queued in `sync_queue` with exponential backoff.
+- The user continues chatting as if fully onboarded.
+- Once the backend comes back online, the daemon automatically completes the registration or login in the background — no action required from the user.
+
+### Background sync daemon
+- Started automatically 2 seconds after boot (so processors are registered first).
+- Polls every 15 seconds for due items.
+- Retry schedule: 30 s → 1 min → 2 min → 5 min → 10 min (then 10 min for all subsequent attempts).
+- Max 10 attempts per item (configurable per enqueue call).
+- Persisted in PostgreSQL — survives bot restarts, server restarts, and WhatsApp reconnects.
+- Pending count is visible at `GET /health` → `pendingSync`.
+
+### Graceful degradation
+When the backend is offline:
+- Provider search falls back to the local artisan database.
+- The AI is informed of the outage and continues helping with general questions, service information, and enquiries.
+- Only features that strictly require live backend data (bookings, job management) are temporarily unavailable, and the AI explains this naturally.
+
+### Smarter AI conversations
+- Up to 20 messages of conversation history are threaded into every prompt.
+- The AI resolves follow-up questions without requiring the user to repeat context ("the second one", "what about in Lekki?").
+- Intent extraction detects `is_followup` and `topic_changed` flags to guide natural transitions.
+- The system prompt is sent in the correct `system` role — no more system instructions mixed into the user turn.
+- Warm, consistent personality ("Ava") across all user roles.
+
+### Conversation memory
+Stored in PostgreSQL (`bot_sessions`) with in-memory fallback:
+- Message history (last 50 messages)
+- User preferences (name, last service, last location, last budget)
+- Registration / onboarding state
+- Last shown providers (for follow-up "connect me to #2" messages)
+
+---
+
+## HTTP endpoints
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/health` | none | Bot status, AI key health, pending sync count |
+| `POST` | `/send` | `X-Internal-Key` | Send a WhatsApp message from the backend |
+
+### `/health` response
+```json
 {
-  "2348012345678": {
-    messages: [{ role: "user", text: "...", at: "..." }, ...],
-    userPreferences: { lastService: "electrician", lastLocation: "Ikeja", lastBudget: null }
-  }
+  "status": "ok",
+  "service": "haven-bot",
+  "connected": true,
+  "pendingSync": 0,
+  "aiKeys": [{ "provider": "groq", "keyIndex": 1, "active": true, "healthy": true, "failCount": 0 }],
+  "timestamp": "2026-06-25T20:00:00.000Z"
 }
 ```
 
-This is intentionally isolated behind a small interface (`getSession`, `appendMessage`,
-`setPreferences`, etc.) so swapping in PostgreSQL/MongoDB later only requires rewriting
-`whatsapp/session.js` — no other file needs to change.
+### `/send` request body
+```json
+{ "to": "2348012345678", "text": "Your booking has been confirmed!" }
+```
 
 ---
 
-## 7. Security & reliability notes
+## Database schema
 
-- All user input is length-checked and validated before being sent to Gemini.
-- Gemini failures (timeouts, malformed JSON, rate limits) never crash the process — the
-  agent falls back to deterministic, rule-based replies (`ai/agent.js` →
-  `buildDeterministicFallback`).
-- Database failures automatically fall back to mock data per-request.
-- `process.on('uncaughtException'/'unhandledRejection')` guards are in place in
-  `index.js`.
-- Group messages are ignored by default (`config.whatsapp.ignoreGroups`).
-- The AI is explicitly instructed (system prompt in `ai/prompt.js`) to never invent
-  artisan data and to only use artisans actually returned by search.
+Four tables are created automatically on boot (idempotent `CREATE TABLE IF NOT EXISTS`):
+
+| Table | Purpose |
+|---|---|
+| `artisans` | Local provider search index |
+| `bot_sessions` | Per-conversation message history + preferences |
+| `local_user_profiles` | Temporary profiles before backend sync succeeds |
+| `sync_queue` | Persistent retry queue for failed backend requests |
 
 ---
 
-## 8. What's next (hooks for the real backend)
+## Deployment (Render)
 
-- Replace `artisans/mockData.js`-based filtering with your production search/recommendation
-  service once it's ready — `artisanService.js` already isolates this behind
-  `searchArtisans()`.
-- Replace `geocodeLocation()` in `artisanService.js` with a real geocoding API call.
-- Add a "connect me" flow that notifies the chosen artisan and/or creates a job request
-  in your backend (currently the bot only offers to connect, per the system prompt).
-- Swap `whatsapp/session.js` for a persistent store (Postgres/Mongo/Redis) for multi-instance
-  deployments.
+1. Create a **Web Service** pointing at this repo.
+2. Set all required environment variables.
+3. Set `RENDER_EXTERNAL_URL` to your Render URL — this enables the self-ping keep-alive.
+4. Use a **PostgreSQL** add-on (or external DB) and set `DATABASE_URL`.
+5. The bot will generate a pairing code on first boot — check the logs.
